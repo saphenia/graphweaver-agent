@@ -1,0 +1,161 @@
+# Business Rules Configuration
+# Define your business operations here. The agent will execute them
+# and capture lineage via OpenLineage/Marquez.
+
+version: "1.0"
+namespace: "ecommerce"
+
+rules:
+  # Revenue Metrics
+  - name: daily_revenue
+    description: Calculate daily revenue by category
+    type: aggregation
+    sql: |
+      SELECT 
+        c.name as category,
+        DATE(o.order_date) as date,
+        COUNT(DISTINCT o.id) as order_count,
+        SUM(oi.quantity) as items_sold,
+        SUM(oi.quantity * oi.unit_price) as revenue
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      JOIN products p ON oi.product_id = p.id
+      JOIN categories c ON p.category_id = c.id
+      GROUP BY c.name, DATE(o.order_date)
+      ORDER BY date DESC, revenue DESC
+    inputs:
+      - order_items
+      - orders
+      - products
+      - categories
+    outputs:
+      - daily_revenue_report
+    tags:
+      - revenue
+      - daily
+    owner: analytics_team
+
+  # Customer Analytics
+  - name: customer_lifetime_value
+    description: Calculate lifetime value per customer
+    type: metric
+    sql: |
+      SELECT 
+        c.id as customer_id,
+        c.name as customer_name,
+        c.email,
+        COUNT(DISTINCT o.id) as total_orders,
+        SUM(o.total_amount) as lifetime_value,
+        MIN(o.order_date) as first_order,
+        MAX(o.order_date) as last_order,
+        AVG(o.total_amount) as avg_order_value
+      FROM customers c
+      LEFT JOIN orders o ON c.id = o.customer_id
+      GROUP BY c.id, c.name, c.email
+      ORDER BY lifetime_value DESC NULLS LAST
+    inputs:
+      - customers
+      - orders
+    outputs:
+      - customer_clv
+    tags:
+      - customer
+      - clv
+
+  # Product Performance
+  - name: product_performance
+    description: Analyze product sales performance
+    type: aggregation
+    sql: |
+      SELECT 
+        p.id as product_id,
+        p.name as product_name,
+        c.name as category,
+        p.price as unit_price,
+        COUNT(DISTINCT oi.order_id) as times_ordered,
+        SUM(oi.quantity) as total_quantity,
+        SUM(oi.quantity * oi.unit_price) as total_revenue,
+        AVG(oi.quantity) as avg_quantity_per_order
+      FROM products p
+      JOIN categories c ON p.category_id = c.id
+      LEFT JOIN order_items oi ON p.id = oi.product_id
+      GROUP BY p.id, p.name, c.name, p.price
+      ORDER BY total_revenue DESC NULLS LAST
+    inputs:
+      - products
+      - categories
+      - order_items
+    outputs:
+      - product_performance_report
+    tags:
+      - product
+      - sales
+
+  # Supplier Analysis
+  - name: supplier_product_count
+    description: Count products per supplier
+    type: query
+    sql: |
+      SELECT 
+        s.id as supplier_id,
+        s.name as supplier_name,
+        s.contact_email,
+        COUNT(ps.product_id) as product_count,
+        COUNT(CASE WHEN ps.is_primary THEN 1 END) as primary_products
+      FROM suppliers s
+      LEFT JOIN product_suppliers ps ON s.id = ps.supplier_id
+      GROUP BY s.id, s.name, s.contact_email
+      ORDER BY product_count DESC
+    inputs:
+      - suppliers
+      - product_suppliers
+    outputs:
+      - supplier_summary
+    tags:
+      - supplier
+
+  # Data Quality Check
+  - name: orphan_orders_check
+    description: Find orders without valid customers
+    type: validation
+    sql: |
+      SELECT o.*
+      FROM orders o
+      LEFT JOIN customers c ON o.customer_id = c.id
+      WHERE c.id IS NULL
+    inputs:
+      - orders
+      - customers
+    outputs:
+      - data_quality_issues
+    tags:
+      - validation
+      - data_quality
+
+  # Order Fulfillment
+  - name: orders_with_details
+    description: Full order details with customer and items
+    type: query
+    sql: |
+      SELECT 
+        o.id as order_id,
+        o.order_date,
+        c.name as customer_name,
+        c.email as customer_email,
+        COUNT(oi.id) as item_count,
+        SUM(oi.quantity) as total_items,
+        o.total_amount
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      JOIN order_items oi ON o.id = oi.order_id
+      GROUP BY o.id, o.order_date, c.name, c.email, o.total_amount
+      ORDER BY o.order_date DESC
+    inputs:
+      - orders
+      - customers
+      - order_items
+    outputs:
+      - order_details
+    tags:
+      - orders
+      - fulfillment
