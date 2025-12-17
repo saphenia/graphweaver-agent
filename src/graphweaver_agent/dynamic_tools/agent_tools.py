@@ -1,266 +1,343 @@
 """
-Dynamic Tool Management - LangChain Tools Integration
-
-Add these tools to agent.py to enable dynamic tool creation via the LangChain agent.
-
-Usage in agent.py:
-    from graphweaver_agent.dynamic_tools.agent_tools import (
-        check_tool_exists, list_available_tools, create_dynamic_tool,
-        run_dynamic_tool, get_tool_source, update_dynamic_tool, delete_dynamic_tool
-    )
-    
-    # Add to your tools list:
-    tools = [
-        # ... existing tools ...
-        check_tool_exists,
-        list_available_tools,
-        create_dynamic_tool,
-        run_dynamic_tool,
-        get_tool_source,
-        update_dynamic_tool,
-        delete_dynamic_tool,
-    ]
+# /home/abdul/graphweaver-agent/src/graphweaver_agent/dynamic_tools/agent_tools.py
+#
+Dynamic tool management with STREAMING support.
+Uses get_stream_writer() to emit progress during tool creation/execution.
 """
-
+import os
 import json
-from typing import Optional
+import importlib.util
+from typing import Optional, Dict, Any, List
+from pathlib import Path
+
 from langchain_core.tools import tool
 
-from .tool_registry import get_registry, ToolType
+# Try to import streaming support
+try:
+    from langgraph.config import get_stream_writer
+    STREAMING_AVAILABLE = True
+except ImportError:
+    STREAMING_AVAILABLE = False
+    def get_stream_writer():
+        """Dummy writer when streaming not available."""
+        class DummyWriter:
+            def __call__(self, data):
+                pass
+        return DummyWriter()
 
+from .tool_registry import ToolRegistry
+
+# Initialize registry
+DYNAMIC_TOOLS_DIR = os.environ.get(
+    "DYNAMIC_TOOLS_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "dynamic_tools")
+)
+_registry: Optional[ToolRegistry] = None
+
+
+def get_registry() -> ToolRegistry:
+    """Get or create the tool registry."""
+    global _registry
+    if _registry is None:
+        _registry = ToolRegistry(DYNAMIC_TOOLS_DIR)
+    return _registry
+
+
+def emit(data: dict):
+    """Emit streaming data if available."""
+    try:
+        writer = get_stream_writer()
+        writer(data)
+    except Exception:
+        pass  # Streaming not available or not in streaming context
+
+
+# =============================================================================
+# Dynamic Tool Management Tools (with Streaming)
+# =============================================================================
 
 @tool
 def check_tool_exists(tool_name: str) -> str:
-    """Check if a tool exists in the registry.
+    """Check if a dynamic tool already exists.
     
-    Use this to see if a capability already exists before creating a new tool.
+    ALWAYS call this before creating a new tool to avoid duplicates.
     
     Args:
         tool_name: Name of the tool to check
-        
+    
     Returns:
-        Whether the tool exists and its type if found
+        Information about whether the tool exists and its details if it does
     """
+    emit({"status": "checking", "tool": tool_name})
+    
     registry = get_registry()
     
+    # Check dynamic tools
     if registry.tool_exists(tool_name):
-        metadata = registry.get_tool(tool_name)
-        return f"✓ Tool '{tool_name}' exists\n  Type: {metadata.tool_type.value}\n  Description: {metadata.description}"
-    else:
-        return f"✗ Tool '{tool_name}' does not exist. You can create it with create_dynamic_tool."
+        tool_info = registry.get_tool_info(tool_name)
+        emit({"status": "found", "tool": tool_name, "type": "dynamic"})
+        return f"✓ Dynamic tool '{tool_name}' EXISTS\n  Description: {tool_info.get('description', 'N/A')}\n  File: {tool_info.get('file_path', 'N/A')}"
+    
+    # Check builtin tools
+    builtin_tools = [
+        "configure_database", "test_database_connection", "list_database_tables",
+        "get_table_schema", "get_column_stats", "run_fk_discovery",
+        "analyze_potential_fk", "validate_fk_with_data", "clear_neo4j_graph",
+        "add_fk_to_graph", "get_graph_stats", "analyze_graph_centrality",
+        "find_table_communities", "predict_missing_fks", "run_cypher",
+        "generate_text_embeddings", "generate_kg_embeddings", "semantic_search_tables",
+        "semantic_search_columns", "find_similar_tables", "find_similar_columns",
+        "show_sample_business_rules", "load_business_rules", "execute_business_rule",
+        "execute_all_business_rules", "import_lineage_to_graph", "analyze_data_flow",
+        "find_impact_analysis", "test_rdf_connection", "sync_graph_to_rdf",
+        "run_sparql", "learn_rules_with_ltn", "generate_business_rules_from_ltn",
+    ]
+    
+    if tool_name in builtin_tools:
+        emit({"status": "found", "tool": tool_name, "type": "builtin"})
+        return f"✓ Builtin tool '{tool_name}' EXISTS (cannot be modified)"
+    
+    emit({"status": "not_found", "tool": tool_name})
+    return f"✗ Tool '{tool_name}' does NOT exist. You can create it with create_dynamic_tool."
 
 
 @tool
-def list_available_tools(tool_type: Optional[str] = None) -> str:
-    """List all available tools in the registry.
+def list_available_tools() -> str:
+    """List all available tools (builtin and dynamic).
     
-    Use this to see what tools are available for use.
-    
-    Args:
-        tool_type: Filter by type: 'builtin', 'dynamic', or None for all
-        
     Returns:
-        List of tools with their descriptions
+        Categorized list of all available tools
     """
+    emit({"status": "listing", "message": "Gathering tool list..."})
+    
     registry = get_registry()
-    
-    type_filter = None
-    if tool_type:
-        try:
-            type_filter = ToolType(tool_type.lower())
-        except ValueError:
-            return f"Invalid tool type: {tool_type}. Use 'builtin', 'dynamic', or leave empty for all."
-    
-    tools = registry.list_tools(type_filter)
-    
-    if not tools:
-        return "No tools found."
     
     output = "## Available Tools\n\n"
     
-    # Group by type
-    builtin = [t for t in tools if t.tool_type == ToolType.BUILTIN]
-    dynamic = [t for t in tools if t.tool_type == ToolType.DYNAMIC]
+    # Builtin tools by category
+    output += "### Builtin Tools\n\n"
     
-    if builtin and (type_filter is None or type_filter == ToolType.BUILTIN):
-        output += "### Builtin Tools\n"
-        for t in builtin:
-            output += f"- **{t.name}**: {t.description[:100]}...\n" if len(t.description) > 100 else f"- **{t.name}**: {t.description}\n"
-        output += "\n"
+    categories = {
+        "Database": ["configure_database", "test_database_connection", "list_database_tables", "get_table_schema", "get_column_stats"],
+        "FK Discovery": ["run_fk_discovery", "analyze_potential_fk", "validate_fk_with_data"],
+        "Graph": ["clear_neo4j_graph", "add_fk_to_graph", "get_graph_stats", "analyze_graph_centrality", "find_table_communities", "predict_missing_fks", "run_cypher"],
+        "Embeddings": ["generate_text_embeddings", "generate_kg_embeddings", "semantic_search_tables", "semantic_search_columns", "find_similar_tables", "find_similar_columns"],
+        "Business Rules": ["show_sample_business_rules", "load_business_rules", "execute_business_rule", "execute_all_business_rules", "import_lineage_to_graph", "analyze_data_flow", "find_impact_analysis"],
+        "RDF": ["test_rdf_connection", "sync_graph_to_rdf", "run_sparql"],
+        "LTN": ["learn_rules_with_ltn", "generate_business_rules_from_ltn"],
+        "Dynamic Tools": ["check_tool_exists", "list_available_tools", "create_dynamic_tool", "run_dynamic_tool", "get_tool_source", "update_dynamic_tool", "delete_dynamic_tool"],
+    }
     
-    if dynamic and (type_filter is None or type_filter == ToolType.DYNAMIC):
-        output += "### Dynamic Tools\n"
-        for t in dynamic:
-            tags = f" [{', '.join(t.tags)}]" if t.tags else ""
-            output += f"- **{t.name}**{tags}: {t.description[:100]}...\n" if len(t.description) > 100 else f"- **{t.name}**{tags}: {t.description}\n"
-        output += "\n"
+    for category, tools in categories.items():
+        output += f"**{category}**: {', '.join(tools)}\n"
     
+    # Dynamic tools
+    dynamic_tools = registry.list_tools()
+    
+    if dynamic_tools:
+        output += "\n### Dynamic Tools (User Created)\n\n"
+        for tool_info in dynamic_tools:
+            emit({"dynamic_tool": tool_info['name']})
+            output += f"- **{tool_info['name']}**: {tool_info.get('description', 'No description')}\n"
+    else:
+        output += "\n### Dynamic Tools\n\nNo dynamic tools created yet.\n"
+    
+    emit({"status": "complete", "dynamic_count": len(dynamic_tools)})
     return output
 
 
 @tool
-def create_dynamic_tool(
-    name: str,
-    code: str,
-    description: str,
-    dependencies: Optional[str] = None,
-    tags: Optional[str] = None
-) -> str:
+def create_dynamic_tool(name: str, description: str, code: str) -> str:
     """Create a new dynamic tool from Python code.
     
-    The code MUST define a function named 'run' that will be called when the tool is executed.
-    The function should accept keyword arguments and return a string result.
+    The code MUST define a function called `run()` that will be the tool's entry point.
+    The `run()` function should have type hints and a docstring.
+    
+    IMPORTANT: Always call check_tool_exists first to avoid duplicates!
+    
+    Args:
+        name: Unique name for the tool (snake_case, e.g., 'json_parser')
+        description: Brief description of what the tool does
+        code: Python source code defining a run() function
     
     Example code:
-```python
-    def run(data: str, format: str = "json") -> str:
-        # Process data
-        result = do_something(data)
-        return f"Processed: {result}"
-```
+        def run(data: str, format: str = "json") -> str:
+            \"\"\"Process data in the specified format.\"\"\"
+            import json
+            parsed = json.loads(data)
+            return f"Processed {len(parsed)} items"
     
-    Args:
-        name: Tool name (alphanumeric and underscores only)
-        code: Python code with a 'run' function
-        description: What the tool does
-        dependencies: Comma-separated list of pip packages (e.g., "pandas,numpy")
-        tags: Comma-separated tags for categorization (e.g., "data,analysis")
-        
     Returns:
-        Success/failure message
+        Success message or error details
     """
-    print(f"[CREATE_TOOL] === FUNCTION CALLED ===")
-    print(f"[CREATE_TOOL] name: {name}")
-    print(f"[CREATE_TOOL] description: {description}")
-    print(f"[CREATE_TOOL] code length: {len(code) if code else 0}")
-    print(f"[CREATE_TOOL] code:\n{code}")
-    print(f"[CREATE_TOOL] dependencies: {dependencies}")
-    print(f"[CREATE_TOOL] tags: {tags}")
+    emit({"status": "creating", "tool": name})
+    emit({"status": "validating", "message": "Checking tool name and code..."})
     
+    # Validate name
+    if not name.replace("_", "").isalnum():
+        emit({"status": "error", "message": "Invalid tool name"})
+        return f"ERROR: Tool name must be alphanumeric with underscores. Got: '{name}'"
+    
+    # Check if exists
     registry = get_registry()
+    if registry.tool_exists(name):
+        emit({"status": "error", "message": "Tool already exists"})
+        return f"ERROR: Tool '{name}' already exists. Use update_dynamic_tool to modify it."
     
-    # Parse dependencies
-    deps = [d.strip() for d in dependencies.split(",")] if dependencies else []
-    tag_list = [t.strip() for t in tags.split(",")] if tags else []
+    # Validate code has run() function
+    emit({"status": "validating", "message": "Checking for run() function..."})
+    if "def run(" not in code:
+        emit({"status": "error", "message": "Missing run() function"})
+        return "ERROR: Code must define a `run()` function. Example:\n\ndef run(arg: str) -> str:\n    \"\"\"Description.\"\"\"\n    return result"
     
-    result = registry.create_tool(
-        name=name,
-        code=code,
-        description=description,
-        dependencies=deps,
-        tags=tag_list,
-        test_first=True,
-    )
+    # Try to compile the code
+    emit({"status": "compiling", "message": "Compiling Python code..."})
+    try:
+        compile(code, f"<tool:{name}>", "exec")
+    except SyntaxError as e:
+        emit({"status": "error", "message": f"Syntax error: {e}"})
+        return f"ERROR: Syntax error in code:\n{e}"
     
-    print(f"[CREATE_TOOL] result: {result}")
-    
-    if result["success"]:
-        return f"✓ Tool '{name}' created successfully!\n  File: {result['file']}\n  You can now use run_dynamic_tool to execute it."
-    else:
-        return f"✗ Failed to create tool: {result['error']}"
+    # Save the tool
+    emit({"status": "saving", "message": "Writing tool file..."})
+    try:
+        file_path = registry.create_tool(name, description, code)
+        emit({"status": "complete", "tool": name, "file": file_path})
+        return f"✓ Created tool '{name}'\n  File: {file_path}\n  Description: {description}\n\nUse run_dynamic_tool('{name}', ...) to execute it."
+    except Exception as e:
+        emit({"status": "error", "message": str(e)})
+        return f"ERROR creating tool: {type(e).__name__}: {e}"
+
 
 @tool
-def run_dynamic_tool(tool_name: str, arguments: Optional[str] = None) -> str:
-    """Execute a dynamic tool with the given arguments.
+def run_dynamic_tool(tool_name: str, **kwargs) -> str:
+    """Execute a dynamic tool by name.
     
     Args:
-        tool_name: Name of the tool to run
-        arguments: JSON string of arguments (e.g., '{"data": "hello", "count": 5}')
-        
+        tool_name: Name of the dynamic tool to run
+        **kwargs: Arguments to pass to the tool's run() function
+    
     Returns:
-        Tool execution result or error message
+        The tool's output or error message
     """
+    emit({"status": "loading", "tool": tool_name})
+    
     registry = get_registry()
     
-    # Parse arguments
-    args = {}
-    if arguments:
-        try:
-            args = json.loads(arguments)
-        except json.JSONDecodeError as e:
-            return f"✗ Invalid arguments JSON: {e}"
+    if not registry.tool_exists(tool_name):
+        emit({"status": "error", "message": "Tool not found"})
+        return f"ERROR: Tool '{tool_name}' not found. Use list_available_tools to see available tools."
     
-    result = registry.run_tool(tool_name, args)
+    emit({"status": "executing", "tool": tool_name, "args": list(kwargs.keys())})
     
-    if result["success"]:
-        return f"✓ Tool Result:\n{result['result']}"
-    else:
-        error = result.get("error", "Unknown error")
-        tb = result.get("traceback", "")
-        return f"✗ Tool execution failed: {error}\n{tb}"
+    try:
+        result = registry.execute_tool(tool_name, **kwargs)
+        emit({"status": "complete", "tool": tool_name})
+        return f"## Tool Output: {tool_name}\n\n{result}"
+    except Exception as e:
+        import traceback
+        emit({"status": "error", "tool": tool_name, "error": str(e)})
+        return f"ERROR executing '{tool_name}':\n{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
 
 
 @tool
 def get_tool_source(tool_name: str) -> str:
     """Get the source code of a dynamic tool.
     
-    Use this to inspect or modify existing tools.
-    
     Args:
         tool_name: Name of the tool
-        
+    
     Returns:
-        Source code or error message
+        The tool's source code or error message
     """
+    emit({"status": "fetching", "tool": tool_name})
+    
     registry = get_registry()
     
-    code = registry.get_tool_code(tool_name)
+    if not registry.tool_exists(tool_name):
+        emit({"status": "error", "message": "Tool not found"})
+        return f"ERROR: Tool '{tool_name}' not found."
     
-    if code is None:
-        metadata = registry.get_tool(tool_name)
-        if metadata is None:
-            return f"✗ Tool '{tool_name}' not found"
-        elif metadata.tool_type == ToolType.BUILTIN:
-            return f"✗ '{tool_name}' is a builtin tool - source not available"
-        else:
-            return f"✗ Source code not available for '{tool_name}'"
-    
-    return f"## Source code for '{tool_name}':\n\n```python\n{code}\n```"
+    try:
+        source = registry.get_tool_source(tool_name)
+        emit({"status": "complete", "tool": tool_name})
+        return f"## Source: {tool_name}\n\n```python\n{source}\n```"
+    except Exception as e:
+        emit({"status": "error", "message": str(e)})
+        return f"ERROR: {e}"
 
 
 @tool
-def update_dynamic_tool(tool_name: str, code: str, description: Optional[str] = None) -> str:
-    """Update an existing dynamic tool with new code.
+def update_dynamic_tool(tool_name: str, code: str, description: str = None) -> str:
+    """Update an existing dynamic tool's code.
     
     Args:
         tool_name: Name of the tool to update
-        code: New Python code
-        description: Optional new description
-        
+        code: New Python source code (must define run() function)
+        description: New description (optional, keeps existing if not provided)
+    
     Returns:
-        Success/failure message
+        Success message or error details
     """
+    emit({"status": "updating", "tool": tool_name})
+    
     registry = get_registry()
     
-    result = registry.update_tool(tool_name, code, description)
+    if not registry.tool_exists(tool_name):
+        emit({"status": "error", "message": "Tool not found"})
+        return f"ERROR: Tool '{tool_name}' not found. Use create_dynamic_tool to create it."
     
-    if result["success"]:
-        return f"✓ {result['message']}"
-    else:
-        return f"✗ Failed to update tool: {result['error']}"
+    # Validate code
+    emit({"status": "validating", "message": "Checking code..."})
+    if "def run(" not in code:
+        emit({"status": "error", "message": "Missing run() function"})
+        return "ERROR: Code must define a `run()` function."
+    
+    try:
+        compile(code, f"<tool:{tool_name}>", "exec")
+    except SyntaxError as e:
+        emit({"status": "error", "message": f"Syntax error: {e}"})
+        return f"ERROR: Syntax error:\n{e}"
+    
+    emit({"status": "saving", "message": "Writing updated code..."})
+    
+    try:
+        registry.update_tool(tool_name, code, description)
+        emit({"status": "complete", "tool": tool_name})
+        return f"✓ Updated tool '{tool_name}'"
+    except Exception as e:
+        emit({"status": "error", "message": str(e)})
+        return f"ERROR: {e}"
 
 
 @tool
 def delete_dynamic_tool(tool_name: str) -> str:
-    """Delete a dynamic tool from the registry.
+    """Delete a dynamic tool.
     
     Args:
         tool_name: Name of the tool to delete
-        
+    
     Returns:
-        Success/failure message
+        Success message or error
     """
+    emit({"status": "deleting", "tool": tool_name})
+    
     registry = get_registry()
     
-    result = registry.delete_tool(tool_name)
+    if not registry.tool_exists(tool_name):
+        emit({"status": "error", "message": "Tool not found"})
+        return f"ERROR: Tool '{tool_name}' not found."
     
-    if result["success"]:
-        return f"✓ {result['message']}"
-    else:
-        return f"✗ Failed to delete tool: {result['error']}"
+    try:
+        registry.delete_tool(tool_name)
+        emit({"status": "complete", "tool": tool_name})
+        return f"✓ Deleted tool '{tool_name}'"
+    except Exception as e:
+        emit({"status": "error", "message": str(e)})
+        return f"ERROR: {e}"
 
 
-# Export all tools
+# Export the tools for use in agent
 DYNAMIC_TOOL_MANAGEMENT_TOOLS = [
     check_tool_exists,
     list_available_tools,
