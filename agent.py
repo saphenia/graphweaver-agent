@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 GraphWeaver LangChain Agent - Claude-powered autonomous FK discovery.
 
@@ -10,19 +11,38 @@ This agent uses Claude to:
 6. Use text and KG embeddings for semantic search
 
 The agent THINKS using Claude and makes decisions, not just runs a script.
+
+MODES:
+- Interactive (default): Chat with the agent
+- Streaming (--stream): Token-by-token streaming with Anthropic SDK
+- Autonomous (--auto): Run full discovery autonomously
+
+FEATURES:
+- Database exploration & FK discovery
+- Neo4j knowledge graph building & analysis
+- Text & KG embeddings with semantic search
+- Business rules execution & lineage tracking (Marquez)
+- RDF/SPARQL support (Apache Jena Fuseki)
+- LTN rule learning
+- Dynamic tool creation at runtime
 """
 import os
 import sys
 from typing import Optional
 
-from langchain_core.tools import tool
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.prebuilt import create_react_agent
+# Force unbuffered output for streaming mode
+os.environ['PYTHONUNBUFFERED'] = '1'
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=False, write_through=True)
 
 # Add paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mcp_servers"))
+
+from langchain_core.tools import tool
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.prebuilt import create_react_agent
 
 from graphweaver_agent import (
     DataSourceConfig, Neo4jConfig, PostgreSQLConnector,
@@ -54,20 +74,18 @@ try:
 except ImportError:
     LTN_AVAILABLE = False
 
-# Dynamic Tools imports
-from graphweaver_agent.dynamic_tools.agent_tools import (
-    check_tool_exists,
-    list_available_tools,
-    create_dynamic_tool,
-    run_dynamic_tool,
-    get_tool_source,
-    update_dynamic_tool,
-    delete_dynamic_tool,
-    DYNAMIC_TOOL_MANAGEMENT_TOOLS,
-)
+# Embeddings imports
+try:
+    from graphweaver_agent.embeddings.text_embeddings import TextEmbedder, embed_all_metadata
+    from graphweaver_agent.embeddings.kg_embeddings import KGEmbedder, generate_all_kg_embeddings
+    from graphweaver_agent.embeddings.vector_indexes import VectorIndexManager
+    from graphweaver_agent.embeddings.semantic_fk import SemanticFKDiscovery
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
 
 # =============================================================================
-# Global Connections
+# Global Connections (Lazy Singletons)
 # =============================================================================
 
 _pg: Optional[PostgreSQLConnector] = None
@@ -79,6 +97,9 @@ _fuseki: Optional[FusekiClient] = None
 _sparql: Optional[SPARQLQueryBuilder] = None
 _rule_learner = None
 _rule_generator = None
+_rules_config: Optional[BusinessRulesConfig] = None
+_marquez_client: Optional[MarquezClient] = None
+_registry = None
 
 
 def get_pg() -> PostgreSQLConnector:
@@ -96,6 +117,19 @@ def get_pg() -> PostgreSQLConnector:
     return _pg
 
 
+def get_pg_config() -> DataSourceConfig:
+    global _pg_config
+    if _pg_config is None:
+        _pg_config = DataSourceConfig(
+            host=os.environ.get("POSTGRES_HOST", "localhost"),
+            port=int(os.environ.get("POSTGRES_PORT", "5432")),
+            database=os.environ.get("POSTGRES_DB", "orders"),
+            username=os.environ.get("POSTGRES_USER", "saphenia"),
+            password=os.environ.get("POSTGRES_PASSWORD", "secret"),
+        )
+    return _pg_config
+
+
 def get_neo4j() -> Neo4jClient:
     global _neo4j
     if _neo4j is None:
@@ -110,7 +144,8 @@ def get_neo4j() -> Neo4jClient:
 def get_text_embedder():
     global _text_embedder
     if _text_embedder is None:
-        from graphweaver_agent.embeddings.text_embeddings import TextEmbedder
+        if not EMBEDDINGS_AVAILABLE:
+            return None
         _text_embedder = TextEmbedder()
     return _text_embedder
 
@@ -118,7 +153,8 @@ def get_text_embedder():
 def get_kg_embedder():
     global _kg_embedder
     if _kg_embedder is None:
-        from graphweaver_agent.embeddings.kg_embeddings import KGEmbedder
+        if not EMBEDDINGS_AVAILABLE:
+            return None
         _kg_embedder = KGEmbedder(get_neo4j())
     return _kg_embedder
 
@@ -135,6 +171,27 @@ def get_sparql() -> SPARQLQueryBuilder:
     if _sparql is None:
         _sparql = SPARQLQueryBuilder(get_fuseki())
     return _sparql
+
+
+def get_marquez() -> MarquezClient:
+    global _marquez_client
+    if _marquez_client is None:
+        _marquez_client = MarquezClient(
+            url=os.environ.get("MARQUEZ_URL", "http://localhost:5000")
+        )
+    return _marquez_client
+
+
+def get_registry():
+    """Get the dynamic tool registry."""
+    global _registry
+    if _registry is None:
+        from graphweaver_agent.dynamic_tools.tool_registry import ToolRegistry
+        _registry = ToolRegistry(
+            os.environ.get("DYNAMIC_TOOLS_DIR",
+                          os.path.join(os.path.dirname(__file__), "dynamic_tools"))
+        )
+    return _registry
 
 
 def get_rule_learner():
@@ -161,7 +218,170 @@ def get_rule_generator():
 
 
 # =============================================================================
-# Tools for Claude to Call
+# Tools - Dynamic Tool Management
+# =============================================================================
+
+@tool
+def check_tool_exists(tool_name: str) -> str:
+    """Check if a dynamic tool exists in the registry.
+    
+    Args:
+        tool_name: Name of the tool to check
+        
+    Returns:
+        Whether the tool exists
+    """
+    return "✓ EXISTS" if get_registry().tool_exists(tool_name) else "✗ NOT FOUND"
+
+
+@tool
+def list_available_tools() -> str:
+    """List all available tools - both builtin and dynamic.
+    
+    Returns a summary of:
+    - Builtin tools (database, FK discovery, graph, embeddings, business rules, RDF, LTN)
+    - Dynamic tools created by the user
+    """
+    dynamic = get_registry().list_tools()
+    output = "## Available Tools\n\n"
+    output += "### Builtin Tools:\n"
+    output += "- **Database**: configure_database, test_database_connection, list_database_tables, get_table_schema, get_column_stats\n"
+    output += "- **FK Discovery**: run_fk_discovery, analyze_potential_fk, validate_fk_with_data\n"
+    output += "- **Graph**: clear_neo4j_graph, add_fk_to_graph, get_graph_stats, analyze_graph_centrality, find_table_communities, predict_missing_fks, run_cypher, connect_datasets_to_tables\n"
+    output += "- **Embeddings**: generate_text_embeddings, generate_kg_embeddings, create_vector_indexes, semantic_search_tables, semantic_search_columns, find_similar_tables, find_similar_columns, predict_fks_from_embeddings, semantic_fk_discovery\n"
+    output += "- **Business Rules**: show_sample_business_rules, load_business_rules, load_business_rules_from_file, list_business_rules, execute_business_rule, execute_all_business_rules, get_marquez_lineage, list_marquez_jobs, import_lineage_to_graph, analyze_data_flow, find_impact_analysis\n"
+    output += "- **RDF/SPARQL**: test_rdf_connection, sync_graph_to_rdf, run_sparql, sparql_list_tables, sparql_get_foreign_keys, sparql_table_lineage, sparql_downstream_impact, sparql_hub_tables, sparql_orphan_tables, sparql_search, get_rdf_statistics, export_rdf_turtle\n"
+    output += "- **LTN**: learn_rules_with_ltn, generate_business_rules_from_ltn, generate_all_validation_rules, export_generated_rules_yaml, export_generated_rules_sql, show_ltn_knowledge_base\n"
+    output += "\n### Dynamic Tools:\n"
+    if dynamic:
+        for t in dynamic:
+            output += f"- **{t['name']}**: {t.get('description', 'No description')}\n"
+    else:
+        output += "- None created yet\n"
+    return output
+
+
+@tool
+def create_dynamic_tool(name: str, description: str, code: str) -> str:
+    """Create a new dynamic tool that can be called later.
+    
+    The code must define a `run()` function that will be executed when the tool is called.
+    The function can accept keyword arguments.
+    
+    Example code:
+    ```python
+    def run(table_name: str = "orders"):
+        # Your tool logic here
+        return f"Processed {table_name}"
+    ```
+    
+    Args:
+        name: Unique name for the tool (e.g., "generate_erd")
+        description: What the tool does
+        code: Python code defining a run() function
+        
+    Returns:
+        Success message or error
+    """
+    r = get_registry()
+    if r.tool_exists(name):
+        return f"ERROR: Tool '{name}' already exists. Use update_dynamic_tool to modify it."
+    if "def run(" not in code:
+        return "ERROR: Code must define a run() function. Example:\ndef run(arg1: str):\n    return f'Result: {arg1}'"
+    try:
+        compile(code, name, "exec")
+        path = r.create_tool(name, description, code)
+        return f"✓ Created tool '{name}' at {path}\n\nYou can now call it with: run_dynamic_tool(tool_name='{name}')"
+    except SyntaxError as e:
+        return f"ERROR: Syntax error in code: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
+@tool
+def run_dynamic_tool(tool_name: str, **kwargs) -> str:
+    """Execute a dynamic tool by name.
+    
+    Args:
+        tool_name: Name of the dynamic tool to execute
+        **kwargs: Arguments to pass to the tool's run() function
+        
+    Returns:
+        The tool's output or error message
+    """
+    r = get_registry()
+    if not r.tool_exists(tool_name):
+        available = [t['name'] for t in r.list_tools()]
+        return f"ERROR: Tool '{tool_name}' not found. Available dynamic tools: {available}"
+    try:
+        return str(r.execute_tool(tool_name, **kwargs))
+    except Exception as e:
+        import traceback
+        return f"ERROR executing tool: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+
+
+@tool
+def get_tool_source(tool_name: str) -> str:
+    """Get the source code of a dynamic tool.
+    
+    Args:
+        tool_name: Name of the tool
+        
+    Returns:
+        The tool's source code or error
+    """
+    r = get_registry()
+    if not r.tool_exists(tool_name):
+        return f"ERROR: Tool '{tool_name}' not found"
+    return r.get_tool_source(tool_name)
+
+
+@tool
+def update_dynamic_tool(tool_name: str, code: str, description: str = None) -> str:
+    """Update an existing dynamic tool's code and/or description.
+    
+    Args:
+        tool_name: Name of the tool to update
+        code: New Python code (must define run() function)
+        description: Optional new description
+        
+    Returns:
+        Success message or error
+    """
+    r = get_registry()
+    if not r.tool_exists(tool_name):
+        return f"ERROR: Tool '{tool_name}' not found. Use create_dynamic_tool to create it."
+    if "def run(" not in code:
+        return "ERROR: Code must define a run() function"
+    try:
+        compile(code, tool_name, "exec")
+        r.update_tool(tool_name, code, description)
+        return f"✓ Updated tool '{tool_name}'"
+    except SyntaxError as e:
+        return f"ERROR: Syntax error in code: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+
+@tool
+def delete_dynamic_tool(tool_name: str) -> str:
+    """Delete a dynamic tool.
+    
+    Args:
+        tool_name: Name of the tool to delete
+        
+    Returns:
+        Success message or error
+    """
+    r = get_registry()
+    if not r.tool_exists(tool_name):
+        return f"ERROR: Tool '{tool_name}' not found"
+    r.delete_tool(tool_name)
+    return f"✓ Deleted tool '{tool_name}'"
+
+
+# =============================================================================
+# Tools - Database Configuration & Exploration
 # =============================================================================
 
 @tool
@@ -202,6 +422,42 @@ def list_database_tables() -> str:
         output += f"  - {t['table_name']}: {t['column_count']} columns, ~{t['row_estimate']} rows\n"
     return output
 
+
+@tool
+def get_table_schema(table_name: str) -> str:
+    """Get columns and primary keys for a table.
+    
+    Args:
+        table_name: Name of table to inspect
+    """
+    meta = get_pg().get_table_metadata(table_name)
+    output = f"Table: {table_name} ({meta.row_count} rows)\n"
+    output += f"Primary Key: {', '.join(meta.primary_key_columns) or 'None'}\n"
+    output += "Columns:\n"
+    for col in meta.columns:
+        pk = " [PK]" if col.is_primary_key else ""
+        output += f"  - {col.column_name}: {col.data_type.value}{pk}\n"
+    return output
+
+
+@tool
+def get_column_stats(table_name: str, column_name: str) -> str:
+    """Get statistics for a column - uniqueness, nulls, samples.
+    
+    Args:
+        table_name: Table name
+        column_name: Column name
+    """
+    stats = get_pg().get_column_statistics(table_name, column_name)
+    return (f"{table_name}.{column_name}:\n"
+            f"  Distinct: {stats.distinct_count}/{stats.total_count} ({stats.uniqueness_ratio:.1%})\n"
+            f"  Nulls: {stats.null_count} ({stats.null_ratio:.1%})\n"
+            f"  Samples: {stats.sample_values[:5]}")
+
+
+# =============================================================================
+# Tools - FK Discovery
+# =============================================================================
 
 @tool
 def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> str:
@@ -278,38 +534,6 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
 
 
 @tool
-def get_table_schema(table_name: str) -> str:
-    """Get columns and primary keys for a table.
-    
-    Args:
-        table_name: Name of table to inspect
-    """
-    meta = get_pg().get_table_metadata(table_name)
-    output = f"Table: {table_name} ({meta.row_count} rows)\n"
-    output += f"Primary Key: {', '.join(meta.primary_key_columns) or 'None'}\n"
-    output += "Columns:\n"
-    for col in meta.columns:
-        pk = " [PK]" if col.is_primary_key else ""
-        output += f"  - {col.column_name}: {col.data_type.value}{pk}\n"
-    return output
-
-
-@tool
-def get_column_stats(table_name: str, column_name: str) -> str:
-    """Get statistics for a column - uniqueness, nulls, samples.
-    
-    Args:
-        table_name: Table name
-        column_name: Column name
-    """
-    stats = get_pg().get_column_statistics(table_name, column_name)
-    return (f"{table_name}.{column_name}:\n"
-            f"  Distinct: {stats.distinct_count}/{stats.total_count} ({stats.uniqueness_ratio:.1%})\n"
-            f"  Nulls: {stats.null_count} ({stats.null_ratio:.1%})\n"
-            f"  Samples: {stats.sample_values[:5]}")
-
-
-@tool
 def analyze_potential_fk(source_table: str, source_column: str, 
                          target_table: str, target_column: str) -> str:
     """Analyze if a column pair could be a FK. Checks types, names, cardinality.
@@ -377,6 +601,10 @@ def validate_fk_with_data(source_table: str, source_column: str,
             f"  {verdict}\n"
             f"  Match rate: {result['match_rate']:.1%} ({result['matches']}/{result['sample_size']})")
 
+
+# =============================================================================
+# Tools - Neo4j Graph
+# =============================================================================
 
 @tool
 def clear_neo4j_graph() -> str:
@@ -546,7 +774,7 @@ def connect_datasets_to_tables() -> str:
 
 
 # =============================================================================
-# Embedding Tools - FIXED TO ACTUALLY WORK
+# Tools - Embeddings & Semantic Search
 # =============================================================================
 
 @tool
@@ -559,10 +787,10 @@ def generate_text_embeddings() -> str:
     
     Use this to enable semantic search capabilities.
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available. Install sentence-transformers: pip install sentence-transformers"
+    
     try:
-        # Import here to ensure it's loaded
-        from graphweaver_agent.embeddings.text_embeddings import embed_all_metadata, TextEmbedder
-        
         print("[generate_text_embeddings] Starting...")
         
         # Get connections
@@ -607,10 +835,10 @@ def generate_kg_embeddings() -> str:
     
     Requires Neo4j GDS plugin (included in docker-compose).
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
-        # Import here to ensure it's loaded
-        from graphweaver_agent.embeddings.kg_embeddings import generate_all_kg_embeddings
-        
         print("[generate_kg_embeddings] Starting...")
         
         neo4j = get_neo4j()
@@ -649,9 +877,10 @@ def create_vector_indexes() -> str:
     
     Run this after generating embeddings to enable fast vector search.
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
-        from graphweaver_agent.embeddings.vector_indexes import VectorIndexManager
-        
         print("[create_vector_indexes] Starting...")
         
         manager = VectorIndexManager(get_neo4j())
@@ -696,6 +925,9 @@ def semantic_search_tables(query: str, top_k: int = 5) -> str:
         query: Natural language search query
         top_k: Number of results to return
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
         print(f"[semantic_search_tables] Query: {query}")
         
@@ -744,6 +976,9 @@ def semantic_search_columns(query: str, top_k: int = 10) -> str:
         query: Natural language search query
         top_k: Number of results to return
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
         print(f"[semantic_search_columns] Query: {query}")
         
@@ -791,6 +1026,9 @@ def find_similar_tables(table_name: str, top_k: int = 5) -> str:
         table_name: Name of the source table
         top_k: Number of similar tables to find
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
         print(f"[find_similar_tables] Finding tables similar to: {table_name}")
         
@@ -853,6 +1091,9 @@ def find_similar_columns(table_name: str, column_name: str, top_k: int = 10) -> 
         column_name: Name of the source column
         top_k: Number of similar columns to find
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
         print(f"[find_similar_columns] Finding columns similar to: {table_name}.{column_name}")
         
@@ -897,6 +1138,9 @@ def predict_fks_from_embeddings(threshold: float = 0.7, top_k: int = 20) -> str:
         threshold: Minimum similarity threshold (0-1)
         top_k: Maximum predictions to return
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
         print(f"[predict_fks_from_embeddings] Threshold: {threshold}, top_k: {top_k}")
         
@@ -934,10 +1178,11 @@ def semantic_fk_discovery(source_table: str = None, min_score: float = 0.6) -> s
         source_table: Limit search to this table (optional)
         min_score: Minimum combined score threshold
     """
+    if not EMBEDDINGS_AVAILABLE:
+        return "ERROR: Embeddings not available."
+    
     try:
         print(f"[semantic_fk_discovery] source_table: {source_table}, min_score: {min_score}")
-        
-        from graphweaver_agent.embeddings.semantic_fk import SemanticFKDiscovery
         
         discovery = SemanticFKDiscovery(
             neo4j_client=get_neo4j(),
@@ -969,21 +1214,8 @@ def semantic_fk_discovery(source_table: str = None, min_score: float = 0.6) -> s
 
 
 # =============================================================================
-# Business Rules & Lineage Tools
+# Tools - Business Rules & Lineage
 # =============================================================================
-
-_rules_config: Optional[BusinessRulesConfig] = None
-_marquez_client: Optional[MarquezClient] = None
-
-
-def get_marquez() -> MarquezClient:
-    global _marquez_client
-    if _marquez_client is None:
-        _marquez_client = MarquezClient(
-            url=os.environ.get("MARQUEZ_URL", "http://localhost:5000")
-        )
-    return _marquez_client
-
 
 @tool
 def show_sample_business_rules() -> str:
@@ -1409,7 +1641,7 @@ def find_impact_analysis(table_name: str) -> str:
 
 
 # =============================================================================
-# RDF Tools
+# Tools - RDF / SPARQL
 # =============================================================================
 
 @tool
@@ -1770,7 +2002,7 @@ def export_rdf_turtle() -> str:
 
 
 # =============================================================================
-# LTN Tools - Logic Tensor Networks for Rule Learning
+# Tools - LTN (Logic Tensor Networks) Rule Learning
 # =============================================================================
 
 @tool
@@ -2061,9 +2293,22 @@ def show_ltn_knowledge_base() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+# =============================================================================
+# System Prompt (shared between LangChain and Streaming modes)
+# =============================================================================
+
 SYSTEM_PROMPT = """You are GraphWeaver Agent - an AI assistant that helps users discover foreign key relationships, execute business rules, capture data lineage, and perform semantic search on database metadata.
 
 ## Your Capabilities:
+
+### Dynamic Tool Management
+- `check_tool_exists` - Check if a dynamic tool exists
+- `list_available_tools` - List all builtin and dynamic tools
+- `create_dynamic_tool` - Create a new custom tool (code must define run() function)
+- `run_dynamic_tool` - Execute a dynamic tool
+- `get_tool_source` - View a dynamic tool's source code
+- `update_dynamic_tool` - Update a dynamic tool
+- `delete_dynamic_tool` - Delete a dynamic tool
 
 ### FK Discovery
 - `run_fk_discovery` - Complete 5-stage FK discovery pipeline
@@ -2133,31 +2378,6 @@ SYSTEM_PROMPT = """You are GraphWeaver Agent - an AI assistant that helps users 
 - `export_generated_rules_sql` - Export rules as SQL script
 - `show_ltn_knowledge_base` - Show LTN axioms and predicates
 
-### Dynamic Tools
-- `check_tool_exists` - Check if a tool exists before creating
-- `list_available_tools` - List all builtin and dynamic tools
-- `create_dynamic_tool` - Create a new tool from Python code
-- `run_dynamic_tool` - Execute a dynamic tool
-- `get_tool_source` - Get source code of a dynamic tool
-- `update_dynamic_tool` - Update existing tool code
-- `delete_dynamic_tool` - Remove a dynamic tool
-
-## Dynamic Tool Workflow:
-
-When asked to create new functionality:
-1. **Check**: Use `check_tool_exists` to see if capability exists
-2. **Create**: Use `create_dynamic_tool` with Python code defining a `run()` function
-3. **Test**: Use `run_dynamic_tool` to verify it works
-4. **Persist**: Tools are saved to `dynamic_tools/` directory for future use
-
-Example tool code:
-```python
-def run(data: str, format: str = "json") -> str:
-    \"\"\"Process data in the specified format.\"\"\"
-    result = do_something(data)
-    return f"Processed: {result}"
-```
-
 ## Typical Workflow:
 
 1. **Discover FKs**: `run_fk_discovery`
@@ -2201,8 +2421,103 @@ def run(data: str, format: str = "json") -> str:
 - Classify tables as fact/dimension/junction
 - Export learned rules as YAML or SQL
 
+## Dynamic Tool Features:
+
+- Create custom tools at runtime
+- Tools persist across sessions
+- Extend capabilities without code changes
+- View and modify tool source code
+
 Be helpful and thorough!"""
 
+
+# =============================================================================
+# LangChain Agent Tools List
+# =============================================================================
+
+ALL_TOOLS = [
+    # Dynamic Tool Management
+    check_tool_exists,
+    list_available_tools,
+    create_dynamic_tool,
+    run_dynamic_tool,
+    get_tool_source,
+    update_dynamic_tool,
+    delete_dynamic_tool,
+    
+    # Database
+    configure_database,
+    test_database_connection,
+    list_database_tables,
+    get_table_schema,
+    get_column_stats,
+    
+    # FK Discovery
+    run_fk_discovery,
+    analyze_potential_fk,
+    validate_fk_with_data,
+    
+    # Neo4j Graph
+    clear_neo4j_graph,
+    add_fk_to_graph,
+    get_graph_stats,
+    analyze_graph_centrality,
+    find_table_communities,
+    predict_missing_fks,
+    run_cypher,
+    connect_datasets_to_tables,
+    
+    # Embeddings & Semantic Search
+    generate_text_embeddings,
+    generate_kg_embeddings,
+    create_vector_indexes,
+    semantic_search_tables,
+    semantic_search_columns,
+    find_similar_tables,
+    find_similar_columns,
+    predict_fks_from_embeddings,
+    semantic_fk_discovery,
+    
+    # Business Rules & Lineage
+    show_sample_business_rules,
+    load_business_rules,
+    load_business_rules_from_file,
+    list_business_rules,
+    execute_business_rule,
+    execute_all_business_rules,
+    get_marquez_lineage,
+    list_marquez_jobs,
+    import_lineage_to_graph,
+    analyze_data_flow,
+    find_impact_analysis,
+    
+    # RDF Tools
+    test_rdf_connection,
+    sync_graph_to_rdf,
+    run_sparql,
+    sparql_list_tables,
+    sparql_get_foreign_keys,
+    sparql_table_lineage,
+    sparql_downstream_impact,
+    sparql_hub_tables,
+    sparql_orphan_tables,
+    sparql_search,
+    get_rdf_statistics,
+    export_rdf_turtle,
+    
+    # LTN Tools
+    learn_rules_with_ltn,
+    generate_business_rules_from_ltn,
+    generate_all_validation_rules,
+    export_generated_rules_yaml,
+    export_generated_rules_sql,
+    show_ltn_knowledge_base,
+]
+
+
+# =============================================================================
+# LangChain Agent Creation
+# =============================================================================
 
 def create_agent(verbose: bool = True):
     """Create the LangGraph agent with Claude."""
@@ -2216,93 +2531,45 @@ def create_agent(verbose: bool = True):
         max_tokens=4096,
     )
     
-    tools = [
-        # Database
-        configure_database,
-        test_database_connection,
-        list_database_tables,
-        get_table_schema,
-        get_column_stats,
-        
-        # FK Discovery
-        run_fk_discovery,
-        analyze_potential_fk,
-        validate_fk_with_data,
-        
-        # Neo4j Graph
-        clear_neo4j_graph,
-        add_fk_to_graph,
-        get_graph_stats,
-        analyze_graph_centrality,
-        find_table_communities,
-        predict_missing_fks,
-        run_cypher,
-        connect_datasets_to_tables,
-        
-        # Embeddings & Semantic Search
-        generate_text_embeddings,
-        generate_kg_embeddings,
-        create_vector_indexes,
-        semantic_search_tables,
-        semantic_search_columns,
-        find_similar_tables,
-        find_similar_columns,
-        predict_fks_from_embeddings,
-        semantic_fk_discovery,
-        
-        # Business Rules & Lineage
-        show_sample_business_rules,
-        load_business_rules,
-        load_business_rules_from_file,
-        list_business_rules,
-        execute_business_rule,
-        execute_all_business_rules,
-        get_marquez_lineage,
-        list_marquez_jobs,
-        import_lineage_to_graph,
-        analyze_data_flow,
-        find_impact_analysis,
-        
-        # RDF Tools
-        test_rdf_connection,
-        sync_graph_to_rdf,
-        run_sparql,
-        sparql_list_tables,
-        sparql_get_foreign_keys,
-        sparql_table_lineage,
-        sparql_downstream_impact,
-        sparql_hub_tables,
-        sparql_orphan_tables,
-        sparql_search,
-        get_rdf_statistics,
-        export_rdf_turtle,
-        
-        # LTN Tools
-        learn_rules_with_ltn,
-        generate_business_rules_from_ltn,
-        generate_all_validation_rules,
-        export_generated_rules_yaml,
-        export_generated_rules_sql,
-        show_ltn_knowledge_base,
-        
-        # Dynamic Tools
-        check_tool_exists,
-        list_available_tools,
-        create_dynamic_tool,
-        run_dynamic_tool,
-        get_tool_source,
-        update_dynamic_tool,
-        delete_dynamic_tool,
-    ]
-    
-    agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
+    agent = create_react_agent(llm, ALL_TOOLS, prompt=SYSTEM_PROMPT)
     
     return agent
 
 
-# =============================================================================
-# Main Entry Points
-# =============================================================================
+def extract_response(result) -> str:
+    """Extract text response from LangGraph result."""
+    if not isinstance(result, dict):
+        return str(result)
+    
+    messages = result.get("messages", [])
+    if not messages:
+        return str(result)
+    
+    # Get the last message
+    last_msg = messages[-1]
+    content = getattr(last_msg, 'content', None)
+    
+    if content is None:
+        return str(last_msg)
+    
+    # Content can be a string or a list of content blocks
+    if isinstance(content, str):
+        return content
+    
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict):
+                if block.get('type') == 'text':
+                    text_parts.append(block.get('text', ''))
+            elif hasattr(block, 'text'):
+                text_parts.append(block.text)
+        return '\n'.join(text_parts) if text_parts else str(content)
+    
+    return str(content)
+
 
 def run_autonomous_discovery(verbose: bool = True) -> dict:
     """Run fully autonomous FK discovery using Claude."""
@@ -2338,15 +2605,14 @@ Go!"""
     return {"output": response}
 
 
-def run_interactive():
-    """Run agent in interactive mode - chat with Claude."""
-    import sys
+def run_interactive_langchain():
+    """Run agent in interactive mode using LangChain - chat with Claude."""
     
     agent = create_agent(verbose=True)
     history = []
     
     print("\n" + "="*60)
-    print("  GraphWeaver Agent - Chat with Claude")
+    print("  GraphWeaver Agent - LangChain Mode")
     print("="*60)
     print("\nI can help you discover FK relationships in your database.")
     print("\nTry saying:")
@@ -2359,7 +2625,7 @@ def run_interactive():
     print("  • 'find tables similar to orders'")
     print("  • 'sync graph to RDF and run SPARQL queries'")
     print("  • 'learn rules with LTN and generate validation rules'")
-    print("  • 'create a tool to format SQL queries'")
+    print("  • 'create a tool that generates an ERD'")
     print("\nType 'quit' to exit.\n")
     sys.stdout.flush()
     
@@ -2383,18 +2649,12 @@ def run_interactive():
             
             messages = history + [HumanMessage(content=user_input)]
             
-            print("[TRACE] Calling agent.invoke...", flush=True)
             result = agent.invoke(
                 {"messages": messages},
                 config={"recursion_limit": 100}
             )
-            print("[TRACE] agent.invoke returned", flush=True)
             
-            # Extract text response from the result
-            print("[TRACE] Calling extract_response...", flush=True)
             response_text = extract_response(result)
-            print(f"[TRACE] extract_response returned: type={type(response_text)}, len={len(str(response_text)) if response_text else 0}", flush=True)
-            print(f"[TRACE] response_text repr: {repr(response_text)[:200]}", flush=True)
             
             print(f"\nAgent: {response_text}\n")
             sys.stdout.flush()
@@ -2411,91 +2671,352 @@ def run_interactive():
         except KeyboardInterrupt:
             print("\n")
             break
-        except BaseException as e:
+        except Exception as e:
             import traceback
-            import sys
-            print("\n" + "="*60, file=sys.stderr)
-            print("EXCEPTION CAUGHT", file=sys.stderr)
-            print("="*60, file=sys.stderr)
-            print(f"Type: {type(e)}", file=sys.stderr)
-            print(f"Name: {type(e).__name__}", file=sys.stderr)
-            print(f"Args: {e.args}", file=sys.stderr)
-            print(f"Str:  '{str(e)}'", file=sys.stderr)
-            print(f"Repr: {repr(e)}", file=sys.stderr)
-            if hasattr(e, 'code'):
-                print(f"Code: {e.code}", file=sys.stderr)
-            if hasattr(e, 'returncode'):
-                print(f"Returncode: {e.returncode}", file=sys.stderr)
-            print("="*60, file=sys.stderr)
-            print("TRACEBACK:", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-            print("="*60, file=sys.stderr)
-            sys.stderr.flush()
-            
-            # Also print to stdout
-            print(f"\n[EXCEPTION] Type: {type(e).__name__}", flush=True)
-            print(f"[EXCEPTION] Message: '{str(e)}'", flush=True)
-            print(f"[EXCEPTION] Args: {e.args}", flush=True)
+            print(f"\n[ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
     
     print("Goodbye!")
 
 
-def extract_response(result) -> str:
-    """Extract text response from LangGraph result."""
-    import sys
-    print(f"[EXTRACT] result type: {type(result)}", file=sys.stderr, flush=True)
+# =============================================================================
+# Streaming Mode (Anthropic SDK)
+# =============================================================================
+
+# Tool definitions for streaming mode (JSON schema format)
+STREAMING_TOOLS = [
+    # Dynamic tool management
+    {"name": "check_tool_exists", "description": "Check if a dynamic tool exists in the registry",
+     "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string", "description": "Name of the tool to check"}}, "required": ["tool_name"]}},
+    {"name": "list_available_tools", "description": "List all available tools - both builtin and dynamic",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "create_dynamic_tool", "description": "Create a new dynamic tool. Code must define a run() function.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "code": {"type": "string"}}, "required": ["name", "description", "code"]}},
+    {"name": "run_dynamic_tool", "description": "Execute a dynamic tool by name",
+     "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string"}}, "required": ["tool_name"]}},
+    {"name": "get_tool_source", "description": "Get the source code of a dynamic tool",
+     "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string"}}, "required": ["tool_name"]}},
+    {"name": "update_dynamic_tool", "description": "Update a dynamic tool's code",
+     "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string"}, "code": {"type": "string"}, "description": {"type": "string"}}, "required": ["tool_name", "code"]}},
+    {"name": "delete_dynamic_tool", "description": "Delete a dynamic tool",
+     "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string"}}, "required": ["tool_name"]}},
+
+    # Database
+    {"name": "configure_database", "description": "Configure which PostgreSQL database to connect to",
+     "input_schema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}, "database": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}}, "required": ["host", "port", "database", "username", "password"]}},
+    {"name": "test_database_connection", "description": "Test the PostgreSQL database connection",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "list_database_tables", "description": "List all tables in the database with column counts",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "get_table_schema", "description": "Get schema details for a table (columns, types, PKs)",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
+    {"name": "get_column_stats", "description": "Get statistics for a column (uniqueness, nulls, samples)",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}, "column_name": {"type": "string"}}, "required": ["table_name", "column_name"]}},
+
+    # FK Discovery
+    {"name": "run_fk_discovery", "description": "Run the full 5-stage FK discovery pipeline on the database",
+     "input_schema": {"type": "object", "properties": {"min_match_rate": {"type": "number", "default": 0.95}, "min_score": {"type": "number", "default": 0.5}}}},
+    {"name": "analyze_potential_fk", "description": "Analyze a potential FK relationship and get a score",
+     "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "source_column": {"type": "string"}, "target_table": {"type": "string"}, "target_column": {"type": "string"}}, "required": ["source_table", "source_column", "target_table", "target_column"]}},
+    {"name": "validate_fk_with_data", "description": "Validate a FK by checking actual data integrity",
+     "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "source_column": {"type": "string"}, "target_table": {"type": "string"}, "target_column": {"type": "string"}}, "required": ["source_table", "source_column", "target_table", "target_column"]}},
+
+    # Graph
+    {"name": "clear_neo4j_graph", "description": "Clear all nodes and relationships from Neo4j",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "add_fk_to_graph", "description": "Add a FK relationship to the Neo4j graph",
+     "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "source_column": {"type": "string"}, "target_table": {"type": "string"}, "target_column": {"type": "string"}, "score": {"type": "number", "default": 1.0}, "cardinality": {"type": "string", "default": "1:N"}}, "required": ["source_table", "source_column", "target_table", "target_column"]}},
+    {"name": "get_graph_stats", "description": "Get statistics about the Neo4j graph",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "analyze_graph_centrality", "description": "Find hub and authority tables in the graph",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "find_table_communities", "description": "Find clusters of related tables",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "predict_missing_fks", "description": "Predict missing FKs based on column naming patterns",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "run_cypher", "description": "Execute a Cypher query on Neo4j",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "connect_datasets_to_tables", "description": "Connect Dataset nodes to their matching Table nodes",
+     "input_schema": {"type": "object", "properties": {}}},
+
+    # Embeddings
+    {"name": "generate_text_embeddings", "description": "Generate text embeddings for all tables, columns, jobs, and datasets",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "generate_kg_embeddings", "description": "Generate knowledge graph embeddings using Neo4j GDS FastRP",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "create_vector_indexes", "description": "Create Neo4j vector indexes for fast similarity search",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "semantic_search_tables", "description": "Search for tables using natural language",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer", "default": 5}}, "required": ["query"]}},
+    {"name": "semantic_search_columns", "description": "Search for columns using natural language",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "top_k": {"type": "integer", "default": 10}}, "required": ["query"]}},
+    {"name": "find_similar_tables", "description": "Find tables similar to a given table",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}, "top_k": {"type": "integer", "default": 5}}, "required": ["table_name"]}},
+    {"name": "find_similar_columns", "description": "Find columns similar to a given column",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}, "column_name": {"type": "string"}, "top_k": {"type": "integer", "default": 10}}, "required": ["table_name", "column_name"]}},
+    {"name": "predict_fks_from_embeddings", "description": "Predict potential FK relationships using KG embeddings",
+     "input_schema": {"type": "object", "properties": {"threshold": {"type": "number", "default": 0.7}, "top_k": {"type": "integer", "default": 20}}}},
+    {"name": "semantic_fk_discovery", "description": "Discover FK relationships using semantic similarity",
+     "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "min_score": {"type": "number", "default": 0.6}}}},
+
+    # Business Rules
+    {"name": "show_sample_business_rules", "description": "Show sample business rules YAML format",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "load_business_rules", "description": "Load business rules from YAML content",
+     "input_schema": {"type": "object", "properties": {"yaml_content": {"type": "string"}}, "required": ["yaml_content"]}},
+    {"name": "load_business_rules_from_file", "description": "Load business rules from a YAML file",
+     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string", "default": "business_rules.yaml"}}}},
+    {"name": "list_business_rules", "description": "List all loaded business rules",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "execute_business_rule", "description": "Execute a single business rule",
+     "input_schema": {"type": "object", "properties": {"rule_name": {"type": "string"}, "capture_lineage": {"type": "boolean", "default": True}}, "required": ["rule_name"]}},
+    {"name": "execute_all_business_rules", "description": "Execute all loaded business rules",
+     "input_schema": {"type": "object", "properties": {"capture_lineage": {"type": "boolean", "default": True}}}},
+    {"name": "get_marquez_lineage", "description": "Get lineage graph for a dataset from Marquez",
+     "input_schema": {"type": "object", "properties": {"dataset_name": {"type": "string"}, "depth": {"type": "integer", "default": 3}}, "required": ["dataset_name"]}},
+    {"name": "list_marquez_jobs", "description": "List all jobs tracked in Marquez",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "import_lineage_to_graph", "description": "Import lineage from Marquez into Neo4j",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "analyze_data_flow", "description": "Analyze complete data flow for a table",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
+    {"name": "find_impact_analysis", "description": "Find all downstream impacts if a table changes",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
+
+    # RDF
+    {"name": "test_rdf_connection", "description": "Test connection to Apache Jena Fuseki",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "sync_graph_to_rdf", "description": "Sync Neo4j graph to RDF/Fuseki",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "run_sparql", "description": "Execute a SPARQL query on Fuseki",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "sparql_list_tables", "description": "List all tables in the RDF store",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "sparql_get_foreign_keys", "description": "Get foreign keys from RDF store",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}}},
+    {"name": "sparql_table_lineage", "description": "Get lineage for a table from RDF store",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
+    {"name": "sparql_downstream_impact", "description": "Find downstream impact via RDF/SPARQL",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
+    {"name": "sparql_hub_tables", "description": "Find hub tables via RDF/SPARQL",
+     "input_schema": {"type": "object", "properties": {"min_connections": {"type": "integer", "default": 2}}}},
+    {"name": "sparql_orphan_tables", "description": "Find tables with no FK relationships via RDF",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "sparql_search", "description": "Search the RDF graph by label",
+     "input_schema": {"type": "object", "properties": {"search_term": {"type": "string"}}, "required": ["search_term"]}},
+    {"name": "get_rdf_statistics", "description": "Get statistics from the RDF store",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "export_rdf_turtle", "description": "Export the graph ontology in Turtle format",
+     "input_schema": {"type": "object", "properties": {}}},
+
+    # LTN
+    {"name": "learn_rules_with_ltn", "description": "Learn logical rules from the knowledge graph using LTN",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "generate_business_rules_from_ltn", "description": "Generate executable rules from learned LTN patterns",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "generate_all_validation_rules", "description": "Generate all validation rules from the graph",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "export_generated_rules_yaml", "description": "Export generated rules as YAML file",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "export_generated_rules_sql", "description": "Export generated rules as SQL script",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "show_ltn_knowledge_base", "description": "Show the LTN knowledge base with axioms",
+     "input_schema": {"type": "object", "properties": {}}},
+]
+
+# Map tool names to functions for streaming mode
+STREAMING_TOOL_FUNCTIONS = {
+    # Dynamic tool management
+    "check_tool_exists": lambda **kw: check_tool_exists.func(**kw),
+    "list_available_tools": lambda **kw: list_available_tools.func(**kw),
+    "create_dynamic_tool": lambda **kw: create_dynamic_tool.func(**kw),
+    "run_dynamic_tool": lambda **kw: run_dynamic_tool.func(**kw),
+    "get_tool_source": lambda **kw: get_tool_source.func(**kw),
+    "update_dynamic_tool": lambda **kw: update_dynamic_tool.func(**kw),
+    "delete_dynamic_tool": lambda **kw: delete_dynamic_tool.func(**kw),
+    # Database
+    "configure_database": lambda **kw: configure_database.func(**kw),
+    "test_database_connection": lambda **kw: test_database_connection.func(**kw),
+    "list_database_tables": lambda **kw: list_database_tables.func(**kw),
+    "get_table_schema": lambda **kw: get_table_schema.func(**kw),
+    "get_column_stats": lambda **kw: get_column_stats.func(**kw),
+    # FK Discovery
+    "run_fk_discovery": lambda **kw: run_fk_discovery.func(**kw),
+    "analyze_potential_fk": lambda **kw: analyze_potential_fk.func(**kw),
+    "validate_fk_with_data": lambda **kw: validate_fk_with_data.func(**kw),
+    # Graph
+    "clear_neo4j_graph": lambda **kw: clear_neo4j_graph.func(**kw),
+    "add_fk_to_graph": lambda **kw: add_fk_to_graph.func(**kw),
+    "get_graph_stats": lambda **kw: get_graph_stats.func(**kw),
+    "analyze_graph_centrality": lambda **kw: analyze_graph_centrality.func(**kw),
+    "find_table_communities": lambda **kw: find_table_communities.func(**kw),
+    "predict_missing_fks": lambda **kw: predict_missing_fks.func(**kw),
+    "run_cypher": lambda **kw: run_cypher.func(**kw),
+    "connect_datasets_to_tables": lambda **kw: connect_datasets_to_tables.func(**kw),
+    # Embeddings
+    "generate_text_embeddings": lambda **kw: generate_text_embeddings.func(**kw),
+    "generate_kg_embeddings": lambda **kw: generate_kg_embeddings.func(**kw),
+    "create_vector_indexes": lambda **kw: create_vector_indexes.func(**kw),
+    "semantic_search_tables": lambda **kw: semantic_search_tables.func(**kw),
+    "semantic_search_columns": lambda **kw: semantic_search_columns.func(**kw),
+    "find_similar_tables": lambda **kw: find_similar_tables.func(**kw),
+    "find_similar_columns": lambda **kw: find_similar_columns.func(**kw),
+    "predict_fks_from_embeddings": lambda **kw: predict_fks_from_embeddings.func(**kw),
+    "semantic_fk_discovery": lambda **kw: semantic_fk_discovery.func(**kw),
+    # Business Rules
+    "show_sample_business_rules": lambda **kw: show_sample_business_rules.func(**kw),
+    "load_business_rules": lambda **kw: load_business_rules.func(**kw),
+    "load_business_rules_from_file": lambda **kw: load_business_rules_from_file.func(**kw),
+    "list_business_rules": lambda **kw: list_business_rules.func(**kw),
+    "execute_business_rule": lambda **kw: execute_business_rule.func(**kw),
+    "execute_all_business_rules": lambda **kw: execute_all_business_rules.func(**kw),
+    "get_marquez_lineage": lambda **kw: get_marquez_lineage.func(**kw),
+    "list_marquez_jobs": lambda **kw: list_marquez_jobs.func(**kw),
+    "import_lineage_to_graph": lambda **kw: import_lineage_to_graph.func(**kw),
+    "analyze_data_flow": lambda **kw: analyze_data_flow.func(**kw),
+    "find_impact_analysis": lambda **kw: find_impact_analysis.func(**kw),
+    # RDF
+    "test_rdf_connection": lambda **kw: test_rdf_connection.func(**kw),
+    "sync_graph_to_rdf": lambda **kw: sync_graph_to_rdf.func(**kw),
+    "run_sparql": lambda **kw: run_sparql.func(**kw),
+    "sparql_list_tables": lambda **kw: sparql_list_tables.func(**kw),
+    "sparql_get_foreign_keys": lambda **kw: sparql_get_foreign_keys.func(**kw),
+    "sparql_table_lineage": lambda **kw: sparql_table_lineage.func(**kw),
+    "sparql_downstream_impact": lambda **kw: sparql_downstream_impact.func(**kw),
+    "sparql_hub_tables": lambda **kw: sparql_hub_tables.func(**kw),
+    "sparql_orphan_tables": lambda **kw: sparql_orphan_tables.func(**kw),
+    "sparql_search": lambda **kw: sparql_search.func(**kw),
+    "get_rdf_statistics": lambda **kw: get_rdf_statistics.func(**kw),
+    "export_rdf_turtle": lambda **kw: export_rdf_turtle.func(**kw),
+    # LTN
+    "learn_rules_with_ltn": lambda **kw: learn_rules_with_ltn.func(**kw),
+    "generate_business_rules_from_ltn": lambda **kw: generate_business_rules_from_ltn.func(**kw),
+    "generate_all_validation_rules": lambda **kw: generate_all_validation_rules.func(**kw),
+    "export_generated_rules_yaml": lambda **kw: export_generated_rules_yaml.func(**kw),
+    "export_generated_rules_sql": lambda **kw: export_generated_rules_sql.func(**kw),
+    "show_ltn_knowledge_base": lambda **kw: show_ltn_knowledge_base.func(**kw),
+}
+
+
+def print_token(text: str) -> None:
+    """Print a single token immediately (no buffering)."""
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def stream_response(client, messages: list) -> tuple:
+    """Stream response from Claude, printing each token as it arrives."""
+    import anthropic
     
-    if not isinstance(result, dict):
-        print(f"[EXTRACT] result is not dict, returning str(result)", file=sys.stderr, flush=True)
-        return str(result)
+    tool_inputs = {}
+    current_block_id = None
+
+    with client.messages.stream(
+        model="claude-sonnet-4-20250514",
+        max_tokens=8192,
+        system=SYSTEM_PROMPT,
+        messages=messages,
+        tools=STREAMING_TOOLS,
+    ) as stream:
+        for event in stream:
+            if event.type == "content_block_start":
+                if event.content_block.type == "tool_use":
+                    current_block_id = event.content_block.id
+                    tool_inputs[current_block_id] = {
+                        "name": event.content_block.name,
+                        "input": ""
+                    }
+                    print_token(f"\n\n🔧 **{event.content_block.name}**\n")
+
+            elif event.type == "content_block_delta":
+                if event.delta.type == "text_delta":
+                    print_token(event.delta.text)
+                elif event.delta.type == "input_json_delta":
+                    if current_block_id:
+                        tool_inputs[current_block_id]["input"] += event.delta.partial_json
+
+            elif event.type == "content_block_stop":
+                current_block_id = None
+
+        return stream.get_final_message(), tool_inputs
+
+
+def run_interactive_streaming():
+    """Run agent in interactive mode with token-by-token streaming."""
+    import anthropic
     
-    messages = result.get("messages", [])
-    print(f"[EXTRACT] messages count: {len(messages)}", file=sys.stderr, flush=True)
-    
-    if not messages:
-        print(f"[EXTRACT] no messages, returning str(result)", file=sys.stderr, flush=True)
-        return str(result)
-    
-    # Get the last message
-    last_msg = messages[-1]
-    print(f"[EXTRACT] last_msg type: {type(last_msg)}", file=sys.stderr, flush=True)
-    
-    # Handle different content types
-    content = getattr(last_msg, 'content', None)
-    print(f"[EXTRACT] content type: {type(content)}", file=sys.stderr, flush=True)
-    print(f"[EXTRACT] content repr: {repr(content)[:500] if content else 'None'}", file=sys.stderr, flush=True)
-    
-    if content is None:
-        print(f"[EXTRACT] content is None, returning str(last_msg)", file=sys.stderr, flush=True)
-        return str(last_msg)
-    
-    # Content can be a string or a list of content blocks
-    if isinstance(content, str):
-        print(f"[EXTRACT] content is str, returning it", file=sys.stderr, flush=True)
-        return content
-    
-    if isinstance(content, list):
-        print(f"[EXTRACT] content is list with {len(content)} items", file=sys.stderr, flush=True)
-        # Extract text from content blocks
-        text_parts = []
-        for i, block in enumerate(content):
-            print(f"[EXTRACT] block[{i}] type: {type(block)}", file=sys.stderr, flush=True)
-            if isinstance(block, str):
-                text_parts.append(block)
-            elif isinstance(block, dict):
-                print(f"[EXTRACT] block[{i}] keys: {block.keys()}", file=sys.stderr, flush=True)
-                if block.get('type') == 'text':
-                    text_parts.append(block.get('text', ''))
-                elif block.get('type') == 'tool_use':
-                    print(f"[EXTRACT] block[{i}] is tool_use, skipping", file=sys.stderr, flush=True)
-            elif hasattr(block, 'text'):
-                text_parts.append(block.text)
-        result_text = '\n'.join(text_parts) if text_parts else str(content)
-        print(f"[EXTRACT] returning joined text, len={len(result_text)}", file=sys.stderr, flush=True)
-        return result_text
-    
-    print(f"[EXTRACT] content is unknown type, returning str(content)", file=sys.stderr, flush=True)
-    return str(content)
+    print("\n" + "=" * 60)
+    print("  🕸️  GraphWeaver Agent - Streaming Mode")
+    print("=" * 60)
+    print("\nI can help you discover FK relationships in your database.")
+    print("Try saying:")
+    print("  • 'connect and show me the tables'")
+    print("  • 'find all foreign keys'")
+    print("  • 'generate embeddings and search for customer columns'")
+    print("  • 'learn rules with LTN and export as YAML'")
+    print("  • 'create a tool that generates an ERD diagram'")
+    print("\nType 'quit' to exit.\n")
+
+    client = anthropic.Anthropic()
+    messages = []
+
+    while True:
+        try:
+            user_input = input("\033[92mYou:\033[0m ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ('quit', 'exit', 'q'):
+                break
+
+            messages.append({"role": "user", "content": user_input})
+
+            print("\n\033[96m🤖 Agent:\033[0m ", end="")
+            sys.stdout.flush()
+
+            # Agentic loop
+            while True:
+                response, tool_inputs = stream_response(client, messages)
+                messages.append({"role": "assistant", "content": response.content})
+
+                if response.stop_reason != "tool_use":
+                    break
+
+                # Execute tool calls
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        print_token("\n⏳ Executing...")
+
+                        fn = STREAMING_TOOL_FUNCTIONS.get(block.name)
+                        if fn:
+                            try:
+                                result = fn(**block.input)
+                            except Exception as e:
+                                result = f"Error: {type(e).__name__}: {e}"
+                        else:
+                            result = f"Unknown tool: {block.name}"
+
+                        print_token(f"\n```\n{result}\n```\n")
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+
+                messages.append({"role": "user", "content": tool_results})
+
+            print("\n")
+
+        except KeyboardInterrupt:
+            print("\n\nInterrupted.")
+            break
+        except Exception as e:
+            print(f"\n\033[31mError: {e}\033[0m")
+            import traceback
+            traceback.print_exc()
+
+    print("\n👋 Goodbye!\n")
 
 
 # =============================================================================
@@ -2505,16 +3026,36 @@ def extract_response(result) -> str:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description="GraphWeaver Agent")
-    parser.add_argument("--auto", "-a", action="store_true", help="Run autonomous discovery then exit")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Less verbose output")
+    parser = argparse.ArgumentParser(
+        description="GraphWeaver Agent - FK Discovery & Knowledge Graph",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  (default)    Interactive chat using LangChain/LangGraph
+  --stream     Interactive chat with token-by-token streaming (Anthropic SDK)
+  --auto       Run autonomous FK discovery then exit
+
+Examples:
+  python graphweaver_agent_complete.py              # LangChain interactive
+  python graphweaver_agent_complete.py --stream     # Streaming interactive
+  python graphweaver_agent_complete.py --auto       # Autonomous discovery
+        """
+    )
+    parser.add_argument("--auto", "-a", action="store_true", 
+                       help="Run autonomous discovery then exit")
+    parser.add_argument("--stream", "-s", action="store_true",
+                       help="Use streaming mode (Anthropic SDK) for token-by-token output")
+    parser.add_argument("--quiet", "-q", action="store_true", 
+                       help="Less verbose output")
     args = parser.parse_args()
     
     if args.auto:
         run_autonomous_discovery(verbose=not args.quiet)
+    elif args.stream:
+        run_interactive_streaming()
     else:
-        # Default is interactive
-        run_interactive()
+        # Default is LangChain interactive
+        run_interactive_langchain()
 
 
 if __name__ == "__main__":
