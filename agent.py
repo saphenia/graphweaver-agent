@@ -462,20 +462,14 @@ def get_column_stats(table_name: str, column_name: str) -> str:
 @tool
 def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> str:
     """
-    Run complete 5-stage FK discovery pipeline on the database.
+    Run complete 5-stage FK discovery pipeline AND persist results to Neo4j.
     
-    This is the main discovery tool that:
-    1. Stage 1 (Statistical): Filters by type compatibility, cardinality, uniqueness
-    2. Stage 2 (Mathematical): Scores using geometric mean of features
-    3. Stage 3 (Sampling): Validates with actual data (checks referential integrity)
-    4. Stage 4 (Graph): Removes cycles, determines cardinality (1:1, 1:N)
-    5. Stage 5 (Semantic): Filters out value columns, validates name patterns
+    This discovers FK relationships and automatically adds them to the Neo4j graph.
+    After running this, you can immediately sync to RDF with sync_graph_to_rdf.
     
     Args:
         min_match_rate: Minimum data match rate to confirm FK (default 0.95 = 95%)
         min_score: Minimum score threshold (default 0.5)
-    
-    Returns detailed results including all scores and statistics.
     """
     try:
         global _pg_config
@@ -502,16 +496,60 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
         # Format output
         summary = result["summary"]
         output = "## FK Discovery Results\n\n"
-        output += "### Pipeline Summary\n"
         output += f"- Tables scanned: {summary['tables_scanned']}\n"
         output += f"- Total columns: {summary['total_columns']}\n"
         output += f"- Initial candidates: {summary['initial_candidates']}\n"
-        output += f"- After Stage 1 (Statistical): {summary['stage1_statistical_passed']}\n"
-        output += f"- After Stage 2 (Mathematical): {summary['stage2_mathematical_passed']}\n"
-        output += f"- After Stage 3 (Sampling): {summary['stage3_sampling_passed']}\n"
         output += f"- **Final FKs discovered: {summary['final_fks_discovered']}**\n"
         output += f"- Duration: {summary['duration_seconds']}s\n\n"
         
+        # =====================================================================
+        # PERSIST TO NEO4J - This is the fix!
+        # =====================================================================
+        if result["discovered_fks"]:
+            try:
+                neo4j = get_neo4j()
+                builder = GraphBuilder(neo4j)
+                
+                # Clear and rebuild
+                builder.clear_graph()
+                
+                # Track tables to avoid duplicates
+                tables_added = set()
+                
+                for fk in result["discovered_fks"]:
+                    rel = fk["relationship"]
+                    # Parse "source_table.source_col → target_table.target_col"
+                    parts = rel.split(" → ")
+                    src_parts = parts[0].split(".")
+                    tgt_parts = parts[1].split(".")
+                    
+                    src_table, src_col = src_parts[0], src_parts[1]
+                    tgt_table, tgt_col = tgt_parts[0], tgt_parts[1]
+                    
+                    # Add tables if not already added
+                    if src_table not in tables_added:
+                        builder.add_table(src_table)
+                        tables_added.add(src_table)
+                    if tgt_table not in tables_added:
+                        builder.add_table(tgt_table)
+                        tables_added.add(tgt_table)
+                    
+                    # Add FK relationship
+                    builder.add_fk_relationship(
+                        src_table, src_col,
+                        tgt_table, tgt_col,
+                        fk["confidence"],
+                        fk["cardinality"]
+                    )
+                
+                output += f"### ✓ Persisted to Neo4j\n"
+                output += f"- Tables added: {len(tables_added)}\n"
+                output += f"- FK relationships added: {len(result['discovered_fks'])}\n\n"
+                
+            except Exception as e:
+                output += f"### ⚠ Neo4j Error: {e}\n\n"
+        
+        # List discovered FKs
         output += "### Discovered Foreign Keys\n\n"
         if result["discovered_fks"]:
             for fk in result["discovered_fks"]:
@@ -519,20 +557,67 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
                 output += f"**{fk['relationship']}**\n"
                 output += f"  - Confidence: {fk['confidence']:.1%}\n"
                 output += f"  - Cardinality: {fk['cardinality']}\n"
-                output += f"  - Scores: name={scores['name_similarity']:.2f}, "
-                output += f"type={scores['type_score']:.2f}, "
-                output += f"uniqueness={scores['uniqueness']:.2f}, "
-                output += f"geometric_mean={scores['geometric_mean']:.2f}, "
-                output += f"match_rate={scores['match_rate']:.1%}\n\n"
+                output += f"  - Match rate: {scores['match_rate']:.1%}\n\n"
         else:
             output += "No foreign keys discovered.\n"
+        
+        output += "\n**Next:** Run `sync_graph_to_rdf` to sync to Fuseki.\n"
         
         return output
     except Exception as e:
         import traceback
         return f"ERROR in FK discovery: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
-
+@tool  
+def discover_and_sync() -> str:
+    """
+    One-stop shop: Discover FKs, build Neo4j graph, and sync to RDF Fuseki.
+    
+    Use this when you want to do everything in one command.
+    """
+    try:
+        output = "## Running Complete Pipeline\n\n"
+        
+        # Step 1: Discovery (this now persists to Neo4j automatically)
+        output += "### Step 1: FK Discovery\n"
+        discovery_result = run_fk_discovery.func()
+        
+        # Extract key info
+        if "ERROR" in discovery_result:
+            return discovery_result
+        
+        output += "✓ Discovery complete and persisted to Neo4j\n\n"
+        
+        # Step 2: Sync to RDF
+        output += "### Step 2: Syncing to RDF\n"
+        
+        fuseki = get_fuseki()
+        neo4j = get_neo4j()
+        
+        # Test Fuseki connection
+        conn = fuseki.test_connection()
+        if not conn.get("success"):
+            output += f"⚠ Fuseki unavailable: {conn.get('error')}\n"
+            output += "Graph is still in Neo4j at http://localhost:7474\n"
+            return output
+        
+        fuseki.ensure_dataset_exists()
+        stats = sync_neo4j_to_rdf(neo4j, fuseki)
+        
+        output += f"- Tables: {stats.get('tables', 0)}\n"
+        output += f"- Columns: {stats.get('columns', 0)}\n"  
+        output += f"- FKs: {stats.get('fks', 0)}\n"
+        output += f"- **Total triples: {stats.get('total_triples', 0)}**\n\n"
+        
+        output += "### ✓ Complete!\n"
+        output += "- Neo4j: http://localhost:7474\n"
+        output += "- Fuseki SPARQL: http://localhost:3030\n"
+        
+        return output
+        
+    except Exception as e:
+        import traceback
+        return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 @tool
 def analyze_potential_fk(source_table: str, source_column: str, 
                          target_table: str, target_column: str) -> str:
@@ -2454,6 +2539,7 @@ ALL_TOOLS = [
     
     # FK Discovery
     run_fk_discovery,
+    discover_and_sync,
     analyze_potential_fk,
     validate_fk_with_data,
     
