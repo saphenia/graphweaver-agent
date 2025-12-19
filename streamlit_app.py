@@ -970,17 +970,15 @@ def impl_learn_rules_with_ltn(epochs: int = 100) -> str:
         return "LTN not available. Please install ltn package."
     try:
         learner = get_rule_learner()
-        results = learner.learn(epochs=epochs)
+        results = learner.learn_rules()
         output = "## LTN Rule Learning Results\n"
-        output += f"- Epochs: {epochs}\n"
-        output += f"- Rules learned: {len(results.get('rules', []))}\n"
-        for r in results.get('rules', []):
-            output += f"  - {r['name']}: confidence {r['confidence']:.3f}\n"
+        output += f"- Rules learned: {len(results)}\n"
+        for r in results:
+            output += f"  - {r.rule_type}: {r.formula} (confidence {r.confidence:.3f})\n"
         return output
     except Exception as e:
         import traceback
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
-
 
 def impl_generate_business_rules_from_ltn() -> str:
     if not LTN_AVAILABLE:
@@ -1055,22 +1053,19 @@ def impl_export_generated_rules_sql() -> str:
         output += f"{r.sql}\n\n"
     return output
 
-
 def impl_show_ltn_knowledge_base() -> str:
     if not LTN_AVAILABLE:
         return "LTN not available."
     try:
-        kb = LTNKnowledgeBase(get_neo4j())
-        state = kb.get_state()
+        kb = LTNKnowledgeBase.create_default()  # ✅ Use class method
+        data = kb.to_dict()                      # ✅ Use existing method
         output = "## LTN Knowledge Base\n"
-        output += f"- Tables: {state.get('tables', 0)}\n"
-        output += f"- Columns: {state.get('columns', 0)}\n"
-        output += f"- FKs: {state.get('fks', 0)}\n"
-        output += f"- Predicates: {state.get('predicates', [])}\n"
+        output += f"- Axioms: {len(data.get('axioms', []))}\n"
+        output += f"- Constraints: {len(data.get('constraints', []))}\n"
+        output += f"- Predicates: {data.get('predicates', [])}\n"
         return output
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
-
 
 def impl_check_tool_exists(tool_name: str) -> str:
     return "✓ EXISTS" if get_registry().tool_exists(tool_name) else "✗ NOT FOUND"

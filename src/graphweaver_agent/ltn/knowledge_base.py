@@ -1,5 +1,5 @@
 """
-LTN Knowledge Base - Store and manage logical axioms and constraints.
+LTN Knowledge Base - Stores axioms, constraints, and predicates.
 
 The knowledge base contains:
 - Axioms: Facts that are known to be true
@@ -70,7 +70,7 @@ class LTNKnowledgeBase:
             self.And = ltn.Wrapper_Connective(ltn.fuzzy_ops.And_Prod())
             self.Or = ltn.Wrapper_Connective(ltn.fuzzy_ops.Or_ProbSum())
             self.Implies = ltn.Wrapper_Connective(ltn.fuzzy_ops.Implies_Reichenbach())
-            self.Equiv = ltn.Wrapper_Connective(ltn.fuzzy_ops.Equiv())
+            self.Equiv = ltn.Wrapper_Connective(ltn.fuzzy_ops.Equiv(and_op=ltn.fuzzy_ops.And_Prod(), implies_op=ltn.fuzzy_ops.Implies_Reichenbach()))
             self.Forall = ltn.Wrapper_Quantifier(ltn.fuzzy_ops.Aggreg_pMeanError(p=2), semantics="forall")
             self.Exists = ltn.Wrapper_Quantifier(ltn.fuzzy_ops.Aggreg_pMean(p=2), semantics="exists")
     
