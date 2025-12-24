@@ -115,7 +115,7 @@ services:
     volumes:
       - fuseki_data:/fuseki
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3030/$/ping"]
+      test: ["CMD", "curl", "-f", "http://localhost:3030/$$/ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -141,8 +141,10 @@ services:
       FUSEKI_DATASET: graphweaver
       TRANSFORMERS_CACHE: /app/.cache/huggingface
       HF_HOME: /app/.cache/huggingface
+      UV_CACHE_DIR: /app/.uv_cache
     volumes:
       - embedding_cache:/app/.cache
+      - uv_cache:/app/.uv_cache
       - ./dynamic_tools:/app/dynamic_tools
     depends_on:
       postgres:
@@ -175,8 +177,10 @@ services:
       FUSEKI_DATASET: graphweaver
       TRANSFORMERS_CACHE: /app/.cache/huggingface
       HF_HOME: /app/.cache/huggingface
+      UV_CACHE_DIR: /app/.uv_cache
     volumes:
       - embedding_cache:/app/.cache
+      - uv_cache:/app/.uv_cache
       - ./dynamic_tools:/app/dynamic_tools
     command: ["uv", "run", "python", "-m", "streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
     depends_on:
@@ -197,3 +201,4 @@ volumes:
   marquez_data:
   fuseki_data:
   embedding_cache:
+  uv_cache:

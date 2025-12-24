@@ -292,7 +292,7 @@ def get_marquez() -> MarquezClient:
     """Get or create Marquez client."""
     if "marquez_client" not in st.session_state:
         st.session_state.marquez_client = MarquezClient(
-            base_url=os.environ.get("MARQUEZ_URL", "http://localhost:5000")
+            url=os.environ.get("MARQUEZ_URL", "http://localhost:5000")
         )
     return st.session_state.marquez_client
 
@@ -419,21 +419,42 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
 
 
 def impl_analyze_potential_fk(source_table: str, source_column: str, target_table: str, target_column: str) -> str:
-    from graphweaver_agent.discovery.pipeline import FKDetectionPipeline
-    
+    """Analyze if a column pair could be a FK. Checks types, names, cardinality."""
     pg = get_pg()
-    pipeline = FKDetectionPipeline(pg)
-    score = pipeline.analyze_candidate(source_table, source_column, target_table, target_column)
     
-    output = f"Analysis: {source_table}.{source_column} → {target_table}.{target_column}\n"
-    output += f"  Score: {score:.3f}\n"
-    if score >= 0.8:
-        output += "  Recommendation: LIKELY FK - Should validate with data\n"
-    elif score >= 0.5:
-        output += "  Recommendation: POSSIBLE FK - Needs investigation\n"
-    else:
-        output += "  Recommendation: UNLIKELY FK\n"
-    return output
+    try:
+        source_stats = pg.get_column_statistics(source_table, source_column)
+        target_stats = pg.get_column_statistics(target_table, target_column)
+        source_meta = pg.get_table_metadata(source_table)
+        target_meta = pg.get_table_metadata(target_table)
+        
+        source_col = next((c for c in source_meta.columns if c.column_name == source_column), None)
+        target_col = next((c for c in target_meta.columns if c.column_name == target_column), None)
+        
+        if not source_col or not target_col:
+            return f"Error: Column not found"
+        
+        # Basic analysis
+        type_compatible = source_col.data_type == target_col.data_type
+        target_unique = target_stats.uniqueness_ratio > 0.95
+        
+        output = f"Analysis: {source_table}.{source_column} → {target_table}.{target_column}\n"
+        output += f"  Type compatible: {type_compatible}\n"
+        output += f"  Target uniqueness: {target_stats.uniqueness_ratio:.1%}\n"
+        output += f"  Source distinct: {source_stats.distinct_count}\n"
+        output += f"  Target distinct: {target_stats.distinct_count}\n"
+        
+        if type_compatible and target_unique:
+            output += f"  Recommendation: LIKELY FK - validate with data\n"
+        elif type_compatible:
+            output += f"  Recommendation: POSSIBLE - target not unique enough\n"
+        else:
+            output += f"  Recommendation: UNLIKELY - type mismatch\n"
+        
+        return output
+    except Exception as e:
+        import traceback
+        return f"Error: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
 def impl_validate_fk_with_data(source_table: str, source_column: str, target_table: str, target_column: str) -> str:
@@ -683,7 +704,7 @@ def impl_load_business_rules(yaml_content: str) -> str:
                 sql=r["sql"],
                 inputs=r.get("inputs", []),
                 outputs=r.get("outputs", []),
-                rule_type=r.get("type", "query"),
+                type=r.get("type", "query"),
                 tags=r.get("tags", []),
             ))
         
@@ -710,7 +731,7 @@ def impl_list_business_rules() -> str:
     config = st.session_state.rules_config
     output = f"## Business Rules (namespace: {config.namespace})\n\n"
     for r in config.rules:
-        output += f"- **{r.name}** ({r.rule_type}): {r.description}\n"
+        output += f"- **{r.name}** ({r.type}): {r.description}\n"
     return output
 
 
@@ -725,8 +746,9 @@ def impl_execute_business_rule(rule_name: str, capture_lineage: bool = True) -> 
         return f"Rule '{rule_name}' not found."
     
     try:
-        executor = BusinessRulesExecutor(get_pg(), get_marquez() if capture_lineage else None)
-        result = executor.execute_rule(rule, capture_lineage=capture_lineage)
+        marquez_url = os.environ.get("MARQUEZ_URL", "http://localhost:5000") if capture_lineage else None
+        executor = BusinessRulesExecutor(get_pg(), marquez_url) if marquez_url else BusinessRulesExecutor(get_pg(), "http://localhost:5000")
+        result = executor.execute_rule(rule, emit_lineage=capture_lineage)
         
         output = f"## Executed: {rule_name}\n"
         output += f"- Rows returned: {result.get('row_count', 0)}\n"
@@ -734,7 +756,8 @@ def impl_execute_business_rule(rule_name: str, capture_lineage: bool = True) -> 
             output += f"- Lineage captured: ✓\n"
         return output
     except Exception as e:
-        return f"ERROR: {type(e).__name__}: {e}"
+        import traceback
+        return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
 def impl_execute_all_business_rules(capture_lineage: bool = True) -> str:
@@ -742,13 +765,14 @@ def impl_execute_all_business_rules(capture_lineage: bool = True) -> str:
         return "No business rules loaded."
     
     config = st.session_state.rules_config
-    executor = BusinessRulesExecutor(get_pg(), get_marquez() if capture_lineage else None)
+    marquez_url = os.environ.get("MARQUEZ_URL", "http://localhost:5000")
+    executor = BusinessRulesExecutor(get_pg(), marquez_url)
     
     output = f"## Executing {len(config.rules)} rules\n\n"
     success = 0
     for rule in config.rules:
         try:
-            result = executor.execute_rule(rule, capture_lineage=capture_lineage)
+            result = executor.execute_rule(rule, emit_lineage=capture_lineage)
             output += f"✓ {rule.name}: {result.get('row_count', 0)} rows\n"
             success += 1
         except Exception as e:
