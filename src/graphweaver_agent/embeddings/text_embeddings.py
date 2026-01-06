@@ -261,9 +261,8 @@ def embed_all_metadata(
     """
     Embed all database metadata and store in Neo4j nodes.
     
-    This function uses MERGE to create nodes if they don't exist,
-    ensuring embeddings are always stored even if FK discovery
-    hasn't been run yet.
+    Uses MERGE to create nodes if they don't exist, ensuring embeddings
+    are always stored even if the graph hasn't been populated yet.
     
     Args:
         neo4j_client: Neo4j client
@@ -293,8 +292,7 @@ def embed_all_metadata(
             # Embed table
             table_emb = embedder.embed_table_metadata(table_name, column_names)
             
-            # FIXED: Use MERGE instead of MATCH to create Table node if it doesn't exist
-            # This ensures embeddings are stored even before FK discovery runs
+            # Store on Table node - USE MERGE TO CREATE IF NOT EXISTS
             neo4j_client.run_write("""
                 MERGE (t:Table {name: $name})
                 SET t.text_embedding = $embedding,
@@ -305,6 +303,7 @@ def embed_all_metadata(
                 "model": table_emb.model,
             })
             stats["tables"] += 1
+            print(f"[embed_all_metadata] Embedded table: {table_name}")
             
             # Embed each column
             for col in meta.columns:
@@ -314,8 +313,8 @@ def embed_all_metadata(
                     data_type=col.data_type.value if col.data_type else None,
                 )
                 
-                # FIXED: Use MERGE to create Column node and relationship if they don't exist
-                # First ensure the table exists, then MERGE the column with BELONGS_TO relationship
+                # Store on Column node - USE MERGE TO CREATE IF NOT EXISTS
+                # First ensure table exists, then merge column with relationship
                 neo4j_client.run_write("""
                     MERGE (t:Table {name: $table_name})
                     MERGE (c:Column {name: $col_name, table: $table_name})
@@ -332,10 +331,11 @@ def embed_all_metadata(
                 
         except Exception as e:
             print(f"[embed_all_metadata] Error processing {table_name}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     # Embed Job nodes (from lineage)
-    # Jobs only exist if lineage has been imported, so we still use MATCH here
     jobs = neo4j_client.run_query("MATCH (j:Job) RETURN j.name as name, j.description as desc")
     if jobs:
         print(f"[embed_all_metadata] Processing {len(jobs)} jobs...")
@@ -344,7 +344,7 @@ def embed_all_metadata(
             job_emb = embedder.embed_text(text)
             
             neo4j_client.run_write("""
-                MATCH (j:Job {name: $name})
+                MERGE (j:Job {name: $name})
                 SET j.text_embedding = $embedding,
                     j.embedding_model = $model
             """, {
@@ -355,7 +355,6 @@ def embed_all_metadata(
             stats["jobs"] += 1
     
     # Embed Dataset nodes (from lineage)
-    # Datasets only exist if lineage has been imported, so we still use MATCH here
     datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN d.name as name")
     if datasets:
         print(f"[embed_all_metadata] Processing {len(datasets)} datasets...")
@@ -363,7 +362,7 @@ def embed_all_metadata(
             ds_emb = embedder.embed_text(ds["name"])
             
             neo4j_client.run_write("""
-                MATCH (d:Dataset {name: $name})
+                MERGE (d:Dataset {name: $name})
                 SET d.text_embedding = $embedding,
                     d.embedding_model = $model
             """, {

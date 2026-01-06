@@ -39,8 +39,10 @@ class Neo4jClient:
     
     def run_write(self, query: str, params: Optional[Dict] = None):
         with self.session() as session:
-            session.run(query, params or {})
-    
+            p = params or {}
+            result = session.run(query, p)
+            result.consume()
+
     def test_connection(self) -> Dict[str, Any]:
         try:
             self.run_query("RETURN 1")
