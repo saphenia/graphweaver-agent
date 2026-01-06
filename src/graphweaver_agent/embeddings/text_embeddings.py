@@ -1,8 +1,14 @@
+# =============================================================================
+# FILE: src/graphweaver_agent/embeddings/text_embeddings.py
+# =============================================================================
 """
 Text Embeddings - Generate semantic embeddings for database metadata.
 
 Uses sentence-transformers with all-MiniLM-L6-v2 (384 dimensions).
 Embeddings are stored directly on Neo4j nodes for combined graph+vector queries.
+
+FIXED: Uses batched UNWIND queries instead of individual writes to prevent
+Neo4j connection exhaustion and ensure proper transaction commits.
 """
 import os
 from typing import List, Dict, Any, Optional
@@ -261,9 +267,8 @@ def embed_all_metadata(
     """
     Embed all database metadata and store in Neo4j nodes.
     
-    This function uses MERGE to create nodes if they don't exist,
-    ensuring embeddings are always stored even if FK discovery
-    hasn't been run yet.
+    FIXED: Uses batched UNWIND queries instead of individual writes.
+    This prevents Neo4j connection exhaustion and ensures transactions commit.
     
     Args:
         neo4j_client: Neo4j client
@@ -278,51 +283,40 @@ def embed_all_metadata(
     
     stats = {"tables": 0, "columns": 0, "jobs": 0, "datasets": 0}
     
-    # Get all tables
+    # ==========================================================================
+    # PHASE 1: Collect all embeddings (compute-intensive, no DB writes)
+    # ==========================================================================
+    
+    table_updates = []
+    column_updates = []
+    
     tables = pg_connector.get_tables_with_info()
     print(f"[embed_all_metadata] Processing {len(tables)} tables...")
     
     for table_info in tables:
         table_name = table_info["table_name"]
         
-        # Get table metadata
         try:
             meta = pg_connector.get_table_metadata(table_name)
             column_names = [c.column_name for c in meta.columns]
             
-            # Embed table
+            # Generate table embedding
             table_emb = embedder.embed_table_metadata(table_name, column_names)
-            
-            # FIXED: Use MERGE instead of MATCH to create Table node if it doesn't exist
-            # This ensures embeddings are stored even before FK discovery runs
-            neo4j_client.run_write("""
-                MERGE (t:Table {name: $name})
-                SET t.text_embedding = $embedding,
-                    t.embedding_model = $model
-            """, {
+            table_updates.append({
                 "name": table_name,
                 "embedding": table_emb.embedding,
                 "model": table_emb.model,
             })
             stats["tables"] += 1
             
-            # Embed each column
+            # Generate column embeddings
             for col in meta.columns:
                 col_emb = embedder.embed_column_metadata(
                     table_name=table_name,
                     column_name=col.column_name,
                     data_type=col.data_type.value if col.data_type else None,
                 )
-                
-                # FIXED: Use MERGE to create Column node and relationship if they don't exist
-                # First ensure the table exists, then MERGE the column with BELONGS_TO relationship
-                neo4j_client.run_write("""
-                    MERGE (t:Table {name: $table_name})
-                    MERGE (c:Column {name: $col_name, table: $table_name})
-                    MERGE (c)-[:BELONGS_TO]->(t)
-                    SET c.text_embedding = $embedding,
-                        c.embedding_model = $model
-                """, {
+                column_updates.append({
                     "col_name": col.column_name,
                     "table_name": table_name,
                     "embedding": col_emb.embedding,
@@ -334,44 +328,105 @@ def embed_all_metadata(
             print(f"[embed_all_metadata] Error processing {table_name}: {e}")
             continue
     
-    # Embed Job nodes (from lineage)
-    # Jobs only exist if lineage has been imported, so we still use MATCH here
+    # ==========================================================================
+    # PHASE 2: Batch write all embeddings (single transaction per node type)
+    # ==========================================================================
+    
+    # BATCH WRITE: Tables
+    if table_updates:
+        print(f"[embed_all_metadata] Writing {len(table_updates)} table embeddings...")
+        neo4j_client.run_write("""
+            UNWIND $updates AS update
+            MATCH (t:Table {name: update.name})
+            SET t.text_embedding = update.embedding,
+                t.embedding_model = update.model
+        """, {"updates": table_updates})
+        print(f"[embed_all_metadata] ✓ Table embeddings written")
+    
+    # BATCH WRITE: Columns
+    if column_updates:
+        print(f"[embed_all_metadata] Writing {len(column_updates)} column embeddings...")
+        neo4j_client.run_write("""
+            UNWIND $updates AS update
+            MATCH (c:Column {name: update.col_name})-[:BELONGS_TO]->(t:Table {name: update.table_name})
+            SET c.text_embedding = update.embedding,
+                c.embedding_model = update.model
+        """, {"updates": column_updates})
+        print(f"[embed_all_metadata] ✓ Column embeddings written")
+    
+    # ==========================================================================
+    # PHASE 3: Jobs (from lineage)
+    # ==========================================================================
+    
     jobs = neo4j_client.run_query("MATCH (j:Job) RETURN j.name as name, j.description as desc")
     if jobs:
         print(f"[embed_all_metadata] Processing {len(jobs)} jobs...")
+        job_updates = []
+        
         for job in jobs:
-            text = f"{job['name']} {job.get('desc', '')}"
+            text = f"{job['name']} {job.get('desc', '') or ''}"
             job_emb = embedder.embed_text(text)
-            
-            neo4j_client.run_write("""
-                MATCH (j:Job {name: $name})
-                SET j.text_embedding = $embedding,
-                    j.embedding_model = $model
-            """, {
+            job_updates.append({
                 "name": job["name"],
                 "embedding": job_emb.embedding,
                 "model": job_emb.model,
             })
             stats["jobs"] += 1
+        
+        # BATCH WRITE: Jobs
+        neo4j_client.run_write("""
+            UNWIND $updates AS update
+            MATCH (j:Job {name: update.name})
+            SET j.text_embedding = update.embedding,
+                j.embedding_model = update.model
+        """, {"updates": job_updates})
+        print(f"[embed_all_metadata] ✓ Job embeddings written")
     
-    # Embed Dataset nodes (from lineage)
-    # Datasets only exist if lineage has been imported, so we still use MATCH here
+    # ==========================================================================
+    # PHASE 4: Datasets (from lineage)
+    # ==========================================================================
+    
     datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN d.name as name")
     if datasets:
         print(f"[embed_all_metadata] Processing {len(datasets)} datasets...")
+        ds_updates = []
+        
         for ds in datasets:
             ds_emb = embedder.embed_text(ds["name"])
-            
-            neo4j_client.run_write("""
-                MATCH (d:Dataset {name: $name})
-                SET d.text_embedding = $embedding,
-                    d.embedding_model = $model
-            """, {
+            ds_updates.append({
                 "name": ds["name"],
                 "embedding": ds_emb.embedding,
                 "model": ds_emb.model,
             })
             stats["datasets"] += 1
+        
+        # BATCH WRITE: Datasets
+        neo4j_client.run_write("""
+            UNWIND $updates AS update
+            MATCH (d:Dataset {name: update.name})
+            SET d.text_embedding = update.embedding,
+                d.embedding_model = update.model
+        """, {"updates": ds_updates})
+        print(f"[embed_all_metadata] ✓ Dataset embeddings written")
+    
+    # ==========================================================================
+    # PHASE 5: Verification
+    # ==========================================================================
+    
+    verification = neo4j_client.run_query("""
+        MATCH (n)
+        WHERE n:Table OR n:Column OR n:Job OR n:Dataset
+        WITH labels(n)[0] AS node_type, 
+             count(*) AS total,
+             count(n.text_embedding) AS with_embedding
+        RETURN node_type, total, with_embedding
+        ORDER BY node_type
+    """)
+    
+    print(f"[embed_all_metadata] Verification:")
+    for v in verification:
+        status = "✓" if v["total"] == v["with_embedding"] else "⚠"
+        print(f"  {status} {v['node_type']}: {v['with_embedding']}/{v['total']} have embeddings")
     
     print(f"[embed_all_metadata] Complete: {stats}")
     return stats

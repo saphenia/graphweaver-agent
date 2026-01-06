@@ -1,3 +1,6 @@
+# =============================================================================
+# FILE: src/graphweaver_agent/graph/neo4j_ops.py
+# =============================================================================
 """Neo4j Graph Operations."""
 from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
@@ -38,8 +41,25 @@ class Neo4jClient:
             return [dict(record) for record in result]
     
     def run_write(self, query: str, params: Optional[Dict] = None):
+        """
+        Execute a write query with proper transaction handling.
+        
+        FIXED: Added result.consume() to ensure transaction commits.
+        The Neo4j Python driver requires consuming results for writes to persist.
+        """
         with self.session() as session:
-            session.run(query, params or {})
+            result = session.run(query, params or {})
+            result.consume()  # CRITICAL: Force transaction to complete
+    
+    def run_write_return(self, query: str, params: Optional[Dict] = None) -> List[Dict]:
+        """
+        Execute a write query and return results.
+        Useful when you need to verify what was written.
+        """
+        with self.session() as session:
+            result = session.run(query, params or {})
+            records = [dict(record) for record in result]
+            return records
     
     def test_connection(self) -> Dict[str, Any]:
         try:
