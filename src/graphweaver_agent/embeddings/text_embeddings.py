@@ -261,6 +261,10 @@ def embed_all_metadata(
     """
     Embed all database metadata and store in Neo4j nodes.
     
+    This function uses MERGE to create nodes if they don't exist,
+    ensuring embeddings are always stored even if FK discovery
+    hasn't been run yet.
+    
     Args:
         neo4j_client: Neo4j client
         pg_connector: PostgreSQL connector
@@ -289,9 +293,10 @@ def embed_all_metadata(
             # Embed table
             table_emb = embedder.embed_table_metadata(table_name, column_names)
             
-            # Store on Table node
+            # FIXED: Use MERGE instead of MATCH to create Table node if it doesn't exist
+            # This ensures embeddings are stored even before FK discovery runs
             neo4j_client.run_write("""
-                MATCH (t:Table {name: $name})
+                MERGE (t:Table {name: $name})
                 SET t.text_embedding = $embedding,
                     t.embedding_model = $model
             """, {
@@ -309,9 +314,12 @@ def embed_all_metadata(
                     data_type=col.data_type.value if col.data_type else None,
                 )
                 
-                # Store on Column node
+                # FIXED: Use MERGE to create Column node and relationship if they don't exist
+                # First ensure the table exists, then MERGE the column with BELONGS_TO relationship
                 neo4j_client.run_write("""
-                    MATCH (c:Column {name: $col_name})-[:BELONGS_TO]->(t:Table {name: $table_name})
+                    MERGE (t:Table {name: $table_name})
+                    MERGE (c:Column {name: $col_name, table: $table_name})
+                    MERGE (c)-[:BELONGS_TO]->(t)
                     SET c.text_embedding = $embedding,
                         c.embedding_model = $model
                 """, {
@@ -327,6 +335,7 @@ def embed_all_metadata(
             continue
     
     # Embed Job nodes (from lineage)
+    # Jobs only exist if lineage has been imported, so we still use MATCH here
     jobs = neo4j_client.run_query("MATCH (j:Job) RETURN j.name as name, j.description as desc")
     if jobs:
         print(f"[embed_all_metadata] Processing {len(jobs)} jobs...")
@@ -346,6 +355,7 @@ def embed_all_metadata(
             stats["jobs"] += 1
     
     # Embed Dataset nodes (from lineage)
+    # Datasets only exist if lineage has been imported, so we still use MATCH here
     datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN d.name as name")
     if datasets:
         print(f"[embed_all_metadata] Processing {len(datasets)} datasets...")
