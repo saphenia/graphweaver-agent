@@ -657,8 +657,8 @@ def impl_generate_text_embeddings() -> str:
 
 def impl_generate_kg_embeddings() -> str:
     try:
-        from graphweaver_agent.embeddings.kg_embeddings import generate_fastrp_embeddings
-        stats = generate_fastrp_embeddings(get_neo4j())
+        from graphweaver_agent.embeddings.kg_embeddings import generate_all_kg_embeddings
+        stats = generate_all_kg_embeddings(get_neo4j())
         output = "## KG Embeddings Generated\n"
         output += f"- Nodes embedded: {stats.get('nodes_embedded', 'unknown')}\n"
         return output

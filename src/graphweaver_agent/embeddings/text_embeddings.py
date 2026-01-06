@@ -24,15 +24,6 @@ class TextEmbedder:
     """Generate text embeddings using sentence-transformers."""
     
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize the text embedder.
-        
-        Args:
-            model_name: HuggingFace model name. Default is all-MiniLM-L6-v2 (384 dims).
-                       Other options:
-                       - all-mpnet-base-v2 (768 dims, better quality)
-                       - paraphrase-MiniLM-L3-v2 (384 dims, faster)
-        """
         self.model_name = model_name
         self._model = None
         self.dimensions = 384 if "MiniLM" in model_name else 768
@@ -54,15 +45,6 @@ class TextEmbedder:
         return self._model
     
     def embed_text(self, text: str) -> EmbeddingResult:
-        """
-        Generate embedding for a single text.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            EmbeddingResult with embedding vector
-        """
         embedding = self.model.encode(text, convert_to_numpy=True)
         return EmbeddingResult(
             text=text,
@@ -72,16 +54,6 @@ class TextEmbedder:
         )
     
     def embed_texts(self, texts: List[str], batch_size: int = 32) -> List[EmbeddingResult]:
-        """
-        Generate embeddings for multiple texts.
-        
-        Args:
-            texts: List of texts to embed
-            batch_size: Batch size for encoding
-            
-        Returns:
-            List of EmbeddingResults
-        """
         if not texts:
             return []
         
@@ -112,22 +84,8 @@ class TextEmbedder:
         data_type: Optional[str] = None,
         description: Optional[str] = None,
     ) -> EmbeddingResult:
-        """
-        Generate embedding for a column with rich context.
-        
-        Args:
-            table_name: Name of the table
-            column_name: Name of the column
-            data_type: SQL data type
-            description: Optional description
-            
-        Returns:
-            EmbeddingResult
-        """
-        # Build rich text representation
         parts = [f"{table_name}.{column_name}"]
         
-        # Add semantic hints from name patterns
         col_lower = column_name.lower()
         if col_lower.endswith("_id") or col_lower == "id":
             parts.append("identifier reference key")
@@ -167,20 +125,8 @@ class TextEmbedder:
         column_names: List[str],
         description: Optional[str] = None,
     ) -> EmbeddingResult:
-        """
-        Generate embedding for a table with its columns.
-        
-        Args:
-            table_name: Name of the table
-            column_names: List of column names
-            description: Optional description
-            
-        Returns:
-            EmbeddingResult
-        """
         parts = [table_name]
         
-        # Add semantic hints from table name
         tbl_lower = table_name.lower()
         if "order" in tbl_lower:
             parts.append("transaction purchase sales")
@@ -195,7 +141,6 @@ class TextEmbedder:
         if "config" in tbl_lower or "setting" in tbl_lower:
             parts.append("configuration settings system")
             
-        # Add column context (limit to avoid too long text)
         col_text = " ".join(column_names[:20])
         parts.append(f"columns: {col_text}")
         
@@ -213,41 +158,17 @@ class TextEmbedder:
         inputs: List[str],
         outputs: List[str],
     ) -> EmbeddingResult:
-        """
-        Generate embedding for a business rule.
-        
-        Args:
-            name: Rule name
-            description: Rule description
-            sql: SQL query
-            inputs: Input table names
-            outputs: Output table names
-            
-        Returns:
-            EmbeddingResult
-        """
         parts = [
             name,
             description,
             f"inputs: {' '.join(inputs)}",
             f"outputs: {' '.join(outputs)}",
-            # Add key SQL keywords for context
             sql[:500] if len(sql) > 500 else sql,
         ]
         text = " ".join(parts)
         return self.embed_text(text)
     
     def similarity(self, emb1: List[float], emb2: List[float]) -> float:
-        """
-        Calculate cosine similarity between two embeddings.
-        
-        Args:
-            emb1: First embedding
-            emb2: Second embedding
-            
-        Returns:
-            Cosine similarity score (0-1)
-        """
         a = np.array(emb1)
         b = np.array(emb2)
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
@@ -258,41 +179,24 @@ def embed_all_metadata(
     pg_connector,
     embedder: Optional[TextEmbedder] = None,
 ) -> Dict[str, int]:
-    """
-    Embed all database metadata and store in Neo4j nodes.
-    
-    Uses MERGE to create nodes if they don't exist, ensuring embeddings
-    are always stored even if the graph hasn't been populated yet.
-    
-    Args:
-        neo4j_client: Neo4j client
-        pg_connector: PostgreSQL connector
-        embedder: TextEmbedder instance (creates new if None)
-        
-    Returns:
-        Statistics dict with counts
-    """
+    """Embed all database metadata and store in Neo4j nodes."""
     if embedder is None:
         embedder = TextEmbedder()
     
     stats = {"tables": 0, "columns": 0, "jobs": 0, "datasets": 0}
     
-    # Get all tables
     tables = pg_connector.get_tables_with_info()
     print(f"[embed_all_metadata] Processing {len(tables)} tables...")
     
     for table_info in tables:
         table_name = table_info["table_name"]
         
-        # Get table metadata
         try:
             meta = pg_connector.get_table_metadata(table_name)
             column_names = [c.column_name for c in meta.columns]
             
-            # Embed table
             table_emb = embedder.embed_table_metadata(table_name, column_names)
             
-            # Store on Table node - USE MERGE TO CREATE IF NOT EXISTS
             neo4j_client.run_write("""
                 MERGE (t:Table {name: $name})
                 SET t.text_embedding = $embedding,
@@ -305,7 +209,6 @@ def embed_all_metadata(
             stats["tables"] += 1
             print(f"[embed_all_metadata] Embedded table: {table_name}")
             
-            # Embed each column
             for col in meta.columns:
                 col_emb = embedder.embed_column_metadata(
                     table_name=table_name,
@@ -313,8 +216,6 @@ def embed_all_metadata(
                     data_type=col.data_type.value if col.data_type else None,
                 )
                 
-                # Store on Column node - USE MERGE TO CREATE IF NOT EXISTS
-                # First ensure table exists, then merge column with relationship
                 neo4j_client.run_write("""
                     MERGE (t:Table {name: $table_name})
                     MERGE (c:Column {name: $col_name, table: $table_name})
@@ -335,7 +236,6 @@ def embed_all_metadata(
             traceback.print_exc()
             continue
     
-    # Embed Job nodes (from lineage)
     jobs = neo4j_client.run_query("MATCH (j:Job) RETURN j.name as name, j.description as desc")
     if jobs:
         print(f"[embed_all_metadata] Processing {len(jobs)} jobs...")
@@ -354,7 +254,6 @@ def embed_all_metadata(
             })
             stats["jobs"] += 1
     
-    # Embed Dataset nodes (from lineage)
     datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN d.name as name")
     if datasets:
         print(f"[embed_all_metadata] Processing {len(datasets)} datasets...")
@@ -374,3 +273,76 @@ def embed_all_metadata(
     
     print(f"[embed_all_metadata] Complete: {stats}")
     return stats
+
+
+# =============================================================================
+# Standalone search functions (used by streamlit_app.py)
+# =============================================================================
+
+def search_tables(neo4j_client, embedder: TextEmbedder, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Search tables by semantic similarity to query."""
+    query_emb = embedder.embed_text(query)
+    
+    results = neo4j_client.run_query("""
+        MATCH (t:Table)
+        WHERE t.text_embedding IS NOT NULL
+        WITH t, gds.similarity.cosine(t.text_embedding, $embedding) AS score
+        WHERE score > 0.3
+        RETURN t.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"embedding": query_emb.embedding, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []
+
+
+def search_columns(neo4j_client, embedder: TextEmbedder, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    """Search columns by semantic similarity to query."""
+    query_emb = embedder.embed_text(query)
+    
+    results = neo4j_client.run_query("""
+        MATCH (c:Column)-[:BELONGS_TO]->(t:Table)
+        WHERE c.text_embedding IS NOT NULL
+        WITH t, c, gds.similarity.cosine(c.text_embedding, $embedding) AS score
+        WHERE score > 0.3
+        RETURN t.name AS table, c.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"embedding": query_emb.embedding, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []
+
+
+def find_similar_tables(neo4j_client, table_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Find tables similar to a given table."""
+    results = neo4j_client.run_query("""
+        MATCH (source:Table {name: $table_name})
+        WHERE source.text_embedding IS NOT NULL
+        MATCH (other:Table)
+        WHERE other.name <> $table_name AND other.text_embedding IS NOT NULL
+        WITH other, gds.similarity.cosine(source.text_embedding, other.text_embedding) AS score
+        WHERE score > 0.3
+        RETURN other.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"table_name": table_name, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []
+
+
+def find_similar_columns(neo4j_client, table_name: str, column_name: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    """Find columns similar to a given column."""
+    results = neo4j_client.run_query("""
+        MATCH (source:Column {name: $column_name, table: $table_name})
+        WHERE source.text_embedding IS NOT NULL
+        MATCH (other:Column)-[:BELONGS_TO]->(t:Table)
+        WHERE (other.name <> $column_name OR other.table <> $table_name) 
+          AND other.text_embedding IS NOT NULL
+        WITH t, other, gds.similarity.cosine(source.text_embedding, other.text_embedding) AS score
+        WHERE score > 0.3
+        RETURN t.name AS table, other.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"table_name": table_name, "column_name": column_name, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []

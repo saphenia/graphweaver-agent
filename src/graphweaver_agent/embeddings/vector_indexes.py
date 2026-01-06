@@ -11,12 +11,6 @@ class VectorIndexManager:
     """Manage Neo4j vector indexes."""
     
     def __init__(self, neo4j_client):
-        """
-        Initialize vector index manager.
-        
-        Args:
-            neo4j_client: Neo4j client instance
-        """
         self.neo4j = neo4j_client
         
     def check_vector_support(self) -> bool:
@@ -31,7 +25,6 @@ class VectorIndexManager:
             if result:
                 version = result[0]["version"]
                 major, minor = version.split(".")[:2]
-                # Vector indexes available in 5.11+
                 if int(major) >= 5 and int(minor) >= 11:
                     print(f"[VectorIndexManager] Neo4j {version} supports vector indexes")
                     return True
@@ -42,15 +35,7 @@ class VectorIndexManager:
         return False
     
     def create_text_embedding_indexes(self, dimensions: int = 384) -> Dict[str, bool]:
-        """
-        Create vector indexes for text embeddings on all node types.
-        
-        Args:
-            dimensions: Embedding dimensions (default 384 for MiniLM)
-            
-        Returns:
-            Dict of index name -> success status
-        """
+        """Create vector indexes for text embeddings on all node types."""
         indexes = {
             "table_text_embedding": ("Table", "text_embedding"),
             "column_text_embedding": ("Column", "text_embedding"),
@@ -81,15 +66,7 @@ class VectorIndexManager:
         return results
     
     def create_kg_embedding_indexes(self, dimensions: int = 128) -> Dict[str, bool]:
-        """
-        Create vector indexes for KG embeddings on all node types.
-        
-        Args:
-            dimensions: Embedding dimensions (default 128 for FastRP)
-            
-        Returns:
-            Dict of index name -> success status
-        """
+        """Create vector indexes for KG embeddings on all node types."""
         indexes = {
             "table_kg_embedding": ("Table", "kg_embedding"),
             "column_kg_embedding": ("Column", "kg_embedding"),
@@ -124,16 +101,7 @@ class VectorIndexManager:
         text_dimensions: int = 384, 
         kg_dimensions: int = 128
     ) -> Dict[str, Any]:
-        """
-        Create all vector indexes.
-        
-        Args:
-            text_dimensions: Dimensions for text embeddings
-            kg_dimensions: Dimensions for KG embeddings
-            
-        Returns:
-            Combined results
-        """
+        """Create all vector indexes."""
         return {
             "text_indexes": self.create_text_embedding_indexes(text_dimensions),
             "kg_indexes": self.create_kg_embedding_indexes(kg_dimensions),
@@ -172,12 +140,6 @@ class SemanticSearch:
     """Semantic search using vector indexes."""
     
     def __init__(self, neo4j_client):
-        """
-        Initialize semantic search.
-        
-        Args:
-            neo4j_client: Neo4j client instance
-        """
         self.neo4j = neo4j_client
         
     def search_tables(
@@ -186,173 +148,57 @@ class SemanticSearch:
         top_k: int = 10,
         min_score: float = 0.5,
     ) -> List[Dict[str, Any]]:
-        """
-        Search tables by semantic similarity.
-        
-        Args:
-            query_embedding: Query embedding vector
-            top_k: Number of results
-            min_score: Minimum similarity score
-            
-        Returns:
-            List of matching tables with scores
-        """
+        """Search tables by semantic similarity."""
         result = self.neo4j.run_query("""
-            CALL db.index.vector.queryNodes('table_text_embedding', $top_k, $embedding)
-            YIELD node, score
+            MATCH (t:Table)
+            WHERE t.text_embedding IS NOT NULL
+            WITH t, gds.similarity.cosine(t.text_embedding, $embedding) AS score
             WHERE score >= $min_score
-            RETURN node.name AS table_name, score
+            RETURN t.name AS name, score
             ORDER BY score DESC
+            LIMIT $top_k
         """, {"embedding": query_embedding, "top_k": top_k, "min_score": min_score})
-        
         return [dict(r) for r in result] if result else []
     
     def search_columns(
         self,
         query_embedding: List[float],
-        top_k: int = 10,
+        top_k: int = 20,
         min_score: float = 0.5,
     ) -> List[Dict[str, Any]]:
-        """
-        Search columns by semantic similarity.
-        
-        Args:
-            query_embedding: Query embedding vector
-            top_k: Number of results
-            min_score: Minimum similarity score
-            
-        Returns:
-            List of matching columns with scores
-        """
+        """Search columns by semantic similarity."""
         result = self.neo4j.run_query("""
-            CALL db.index.vector.queryNodes('column_text_embedding', $top_k, $embedding)
-            YIELD node, score
+            MATCH (c:Column)-[:BELONGS_TO]->(t:Table)
+            WHERE c.text_embedding IS NOT NULL
+            WITH t, c, gds.similarity.cosine(c.text_embedding, $embedding) AS score
             WHERE score >= $min_score
-            MATCH (node)-[:BELONGS_TO]->(t:Table)
-            RETURN t.name AS table_name, node.name AS column_name, score
-            ORDER BY score DESC
-        """, {"embedding": query_embedding, "top_k": top_k, "min_score": min_score})
-        
-        return [dict(r) for r in result] if result else []
-    
-    def search_all(
-        self,
-        query_embedding: List[float],
-        top_k: int = 10,
-        min_score: float = 0.5,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Search all node types by semantic similarity.
-        
-        Args:
-            query_embedding: Query embedding vector
-            top_k: Number of results per type
-            min_score: Minimum similarity score
-            
-        Returns:
-            Dict with results for each node type
-        """
-        return {
-            "tables": self.search_tables(query_embedding, top_k, min_score),
-            "columns": self.search_columns(query_embedding, top_k, min_score),
-        }
-    
-    def find_similar_to_table(
-        self,
-        table_name: str,
-        top_k: int = 5,
-        use_text_embedding: bool = True,
-        use_kg_embedding: bool = True,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find tables similar to a given table using combined embeddings.
-        
-        Args:
-            table_name: Source table name
-            top_k: Number of results
-            use_text_embedding: Use text embeddings
-            use_kg_embedding: Use KG embeddings
-            
-        Returns:
-            List of similar tables with combined scores
-        """
-        if use_text_embedding and use_kg_embedding:
-            # Combined similarity
-            result = self.neo4j.run_query("""
-                MATCH (source:Table {name: $name})
-                MATCH (other:Table)
-                WHERE other <> source 
-                  AND other.text_embedding IS NOT NULL 
-                  AND other.kg_embedding IS NOT NULL
-                WITH source, other,
-                     gds.similarity.cosine(source.text_embedding, other.text_embedding) AS text_sim,
-                     gds.similarity.cosine(source.kg_embedding, other.kg_embedding) AS kg_sim
-                WITH other.name AS table_name,
-                     text_sim,
-                     kg_sim,
-                     (text_sim + kg_sim) / 2 AS combined_score
-                RETURN table_name, text_sim, kg_sim, combined_score
-                ORDER BY combined_score DESC
-                LIMIT $top_k
-            """, {"name": table_name, "top_k": top_k})
-        elif use_text_embedding:
-            result = self.neo4j.run_query("""
-                MATCH (source:Table {name: $name})
-                MATCH (other:Table)
-                WHERE other <> source AND other.text_embedding IS NOT NULL
-                WITH other.name AS table_name,
-                     gds.similarity.cosine(source.text_embedding, other.text_embedding) AS score
-                RETURN table_name, score AS text_sim, null AS kg_sim, score AS combined_score
-                ORDER BY score DESC
-                LIMIT $top_k
-            """, {"name": table_name, "top_k": top_k})
-        else:
-            result = self.neo4j.run_query("""
-                MATCH (source:Table {name: $name})
-                MATCH (other:Table)
-                WHERE other <> source AND other.kg_embedding IS NOT NULL
-                WITH other.name AS table_name,
-                     gds.similarity.cosine(source.kg_embedding, other.kg_embedding) AS score
-                RETURN table_name, null AS text_sim, score AS kg_sim, score AS combined_score
-                ORDER BY score DESC
-                LIMIT $top_k
-            """, {"name": table_name, "top_k": top_k})
-            
-        return [dict(r) for r in result] if result else []
-    
-    def find_similar_to_column(
-        self,
-        table_name: str,
-        column_name: str,
-        top_k: int = 10,
-        same_table: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find columns similar to a given column.
-        
-        Args:
-            table_name: Source table name
-            column_name: Source column name
-            top_k: Number of results
-            same_table: Include columns from the same table
-            
-        Returns:
-            List of similar columns
-        """
-        where_clause = "" if same_table else "AND t.name <> $table_name"
-        
-        result = self.neo4j.run_query(f"""
-            MATCH (source:Column {{name: $column_name}})-[:BELONGS_TO]->(st:Table {{name: $table_name}})
-            MATCH (other:Column)-[:BELONGS_TO]->(t:Table)
-            WHERE other <> source 
-              AND other.text_embedding IS NOT NULL
-              {where_clause}
-            WITH t.name AS table_name,
-                 other.name AS column_name,
-                 gds.similarity.cosine(source.text_embedding, other.text_embedding) AS score
-            RETURN table_name, column_name, score
+            RETURN t.name AS table, c.name AS name, score
             ORDER BY score DESC
             LIMIT $top_k
-        """, {"table_name": table_name, "column_name": column_name, "top_k": top_k})
-        
+        """, {"embedding": query_embedding, "top_k": top_k, "min_score": min_score})
         return [dict(r) for r in result] if result else []
+
+
+# =============================================================================
+# Standalone function (used by streamlit_app.py)
+# =============================================================================
+
+def create_all_indexes(neo4j_client) -> Dict[str, Any]:
+    """Create all vector indexes. Standalone wrapper for VectorIndexManager."""
+    manager = VectorIndexManager(neo4j_client)
+    
+    if not manager.check_vector_support():
+        return {"error": "Neo4j version does not support vector indexes (requires 5.11+)"}
+    
+    results = manager.create_all_indexes()
+    
+    # Count successes
+    text_success = sum(1 for v in results["text_indexes"].values() if v)
+    kg_success = sum(1 for v in results["kg_indexes"].values() if v)
+    
+    return {
+        "indexes_created": text_success + kg_success,
+        "text_indexes": text_success,
+        "kg_indexes": kg_success,
+        "details": results,
+    }
