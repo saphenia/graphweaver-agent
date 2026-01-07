@@ -460,7 +460,8 @@ def get_column_stats(table_name: str, column_name: str) -> str:
 # =============================================================================
 
 @tool
-def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> str:
+def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5, 
+                     auto_embed: bool = True) -> str:
     """
     Run complete 5-stage FK discovery pipeline AND persist results to Neo4j.
     
@@ -470,6 +471,7 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
     Args:
         min_match_rate: Minimum data match rate to confirm FK (default 0.95 = 95%)
         min_score: Minimum score threshold (default 0.5)
+        auto_embed: Automatically generate text embeddings after discovery (default True)
     """
     try:
         global _pg_config
@@ -503,18 +505,41 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
         output += f"- Duration: {summary['duration_seconds']}s\n\n"
         
         # =====================================================================
-        # PERSIST TO NEO4J - This is the fix!
+        # PERSIST TO NEO4J WITH AUTO-EMBEDDING
         # =====================================================================
         if result["discovered_fks"]:
             try:
                 neo4j = get_neo4j()
-                builder = GraphBuilder(neo4j)
+                pg = get_pg()
+                
+                # Initialize embedder if auto_embed is enabled
+                embedder = None
+                if auto_embed and EMBEDDINGS_AVAILABLE:
+                    try:
+                        embedder = TextEmbedder.get_shared_instance()
+                        print("[run_fk_discovery] Auto-embedding enabled")
+                    except Exception as emb_err:
+                        print(f"[run_fk_discovery] WARNING: Could not load embedder: {emb_err}")
+                
+                # Create GraphBuilder with optional embedder
+                builder = GraphBuilder(neo4j, embedder=embedder)
+                if embedder:
+                    builder.enable_auto_embedding()
                 
                 # Clear and rebuild
                 builder.clear_graph()
                 
                 # Track tables to avoid duplicates
                 tables_added = set()
+                
+                # Pre-fetch column metadata for better embeddings
+                table_columns = {}
+                try:
+                    for table in pg.get_tables():
+                        meta = pg.get_table_metadata(table)
+                        table_columns[table] = [c.column_name for c in meta.columns]
+                except Exception as meta_err:
+                    print(f"[run_fk_discovery] Warning: Could not get column metadata: {meta_err}")
                 
                 for fk in result["discovered_fks"]:
                     rel = fk["relationship"]
@@ -526,15 +551,21 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
                     src_table, src_col = src_parts[0], src_parts[1]
                     tgt_table, tgt_col = tgt_parts[0], tgt_parts[1]
                     
-                    # Add tables if not already added
+                    # Add tables if not already added (with column names for embedding)
                     if src_table not in tables_added:
-                        builder.add_table(src_table)
+                        builder.add_table(
+                            src_table, 
+                            column_names=table_columns.get(src_table, [])
+                        )
                         tables_added.add(src_table)
                     if tgt_table not in tables_added:
-                        builder.add_table(tgt_table)
+                        builder.add_table(
+                            tgt_table,
+                            column_names=table_columns.get(tgt_table, [])
+                        )
                         tables_added.add(tgt_table)
                     
-                    # Add FK relationship
+                    # Add FK relationship (columns get auto-embedded if enabled)
                     builder.add_fk_relationship(
                         src_table, src_col,
                         tgt_table, tgt_col,
@@ -544,10 +575,30 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
                 
                 output += f"### ✓ Persisted to Neo4j\n"
                 output += f"- Tables added: {len(tables_added)}\n"
-                output += f"- FK relationships added: {len(result['discovered_fks'])}\n\n"
+                output += f"- FK relationships added: {len(result['discovered_fks'])}\n"
+                
+                # Report embedding status
+                if embedder:
+                    try:
+                        coverage = builder.ensure_embeddings_exist()
+                        output += f"\n### ✓ Embeddings Generated\n"
+                        output += f"- Total nodes: {coverage['total']}\n"
+                        output += f"- With embeddings: {coverage['with_embedding']}\n"
+                        output += f"- Coverage: {coverage['coverage']}\n"
+                        if coverage['missing'] > 0:
+                            output += f"- ⚠ Missing: {coverage['missing']} nodes\n"
+                    except Exception as cov_err:
+                        output += f"\n⚠ Could not verify embeddings: {cov_err}\n"
+                else:
+                    output += "\n⚠ **Embeddings not generated.** "
+                    output += "Run `generate_text_embeddings` to enable semantic search.\n"
+                
+                output += "\n"
                 
             except Exception as e:
-                output += f"### ⚠ Neo4j Error: {e}\n\n"
+                import traceback
+                output += f"### ⚠ Neo4j Error: {e}\n"
+                output += f"```\n{traceback.format_exc()}\n```\n\n"
         
         # List discovered FKs
         output += "### Discovered Foreign Keys\n\n"
@@ -567,7 +618,7 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> st
     except Exception as e:
         import traceback
         return f"ERROR in FK discovery: {type(e).__name__}: {e}\n{traceback.format_exc()}"
-
+        
 @tool  
 def discover_and_sync() -> str:
     """
