@@ -1,0 +1,10 @@
+load business_rules.yaml from file then execute all rules
+import this lineage into the Neo4j graph
+Find hub tables that are central to your data ecosystem
+First discover FK relationships in your database2. Add those FKs to the graph 3. Then analyze centrality with both FK and lineage data
+connect all datasets to their matching tables in the graph
+generate text embeddings
+generate kg embeddings
+find similar columns to orders.customer_id
+predict fks from embeddings
+sync graph to RDF
