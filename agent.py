@@ -2009,23 +2009,27 @@ def test_rdf_connection() -> str:
 def sync_graph_to_rdf() -> str:
     """Synchronize the entire Neo4j graph to the RDF triple store.
     
-    This exports all:
-    - Tables and columns
-    - Foreign key relationships
+    ENHANCED VERSION - Exports complete graph including:
+    - Tables with DataSource relationships
+    - Columns with isPrimaryKey, isNullable, isUnique properties
+    - Foreign keys with confidence scores and cardinality
+    - Table-to-Table FK relationships (for easier querying)
     - Jobs and datasets (lineage)
-    - Dataset-table links
+    - READS/WRITES/REPRESENTS relationships
     
-    The RDF store uses standard ontologies (DCAT, PROV-O, Dublin Core)
-    for interoperability with other data catalog systems.
-    
-    FIXED: URL-encode graph URI, inline implementation to avoid module issues.
+    Uses standard ontologies (DCAT, PROV-O, Dublin Core) for interoperability.
     """
     from urllib.parse import quote
     import requests
     
-    print("=" * 60)
-    print("  RDF SYNC - INLINE FIXED VERSION")
-    print("=" * 60)
+    debug_log = []
+    def log(msg):
+        print(msg)
+        debug_log.append(msg)
+    
+    log("=" * 70)
+    log("  ★★★ COMPLETE RDF SYNC (ENHANCED) ★★★")
+    log("=" * 70)
     
     try:
         fuseki = get_fuseki()
@@ -2038,212 +2042,314 @@ def sync_graph_to_rdf() -> str:
         graph_uri = "http://graphweaver.io/graph/main"
         auth = (fuseki.config.username, fuseki.config.password)
         
-        print(f"[RDF] Fuseki URL: {fuseki_url}")
-        print(f"[RDF] Dataset: {dataset}")
-        print(f"[RDF] Graph URI: {graph_uri}")
+        log(f"[CONFIG] Base URL: {base_url}")
+        log(f"[CONFIG] Graph URI: {graph_uri}")
         
-        # Test connection
+        # Test Fuseki
         try:
-            resp = requests.get(f"{fuseki_url}/$/ping", timeout=5)
-            if resp.status_code != 200:
-                return f"ERROR: Fuseki not responding (status {resp.status_code})"
-            print("[RDF] ✓ Fuseki connected")
+            ping_resp = requests.get(f"{fuseki_url}/$/ping", timeout=5)
+            if ping_resp.status_code != 200:
+                return f"ERROR: Fuseki ping failed: {ping_resp.status_code}"
+            log("[PING] ✓ Fuseki OK")
         except Exception as e:
-            return f"ERROR: Cannot connect to Fuseki: {e}"
+            return f"ERROR: Cannot reach Fuseki: {e}"
         
-        # Ensure dataset exists
-        fuseki.ensure_dataset_exists()
+        # Clear graph
+        try:
+            clear_resp = requests.post(
+                f"{base_url}/update",
+                data={"update": f"CLEAR GRAPH <{graph_uri}>"},
+                auth=auth, timeout=30
+            )
+            log(f"[CLEAR] Response: {clear_resp.status_code}")
+        except Exception as e:
+            log(f"[CLEAR] Warning: {e}")
         
-        # Clear existing graph
-        clear_query = f"CLEAR GRAPH <{graph_uri}>"
-        requests.post(f"{base_url}/update", data={"update": clear_query}, auth=auth, timeout=30)
-        print("[RDF] ✓ Graph cleared")
-        
-        # RDF Prefixes
-        PREFIXES = """
-@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        # Build complete Turtle with enhanced prefixes
+        PREFIXES = """@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix dcat: <http://www.w3.org/ns/dcat#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
 @prefix gw: <http://graphweaver.io/ontology#> .
 @prefix gwdata: <http://graphweaver.io/data#> .
+
 """
         
         def uri_safe(name):
-            return name.replace(" ", "_").replace("-", "_").replace(".", "_")
+            if name is None:
+                return "unknown"
+            return str(name).replace(" ", "_").replace("-", "_").replace(".", "_").replace("/", "_")
         
-        def insert_turtle(turtle_content):
-            """Insert turtle with URL-encoded graph URI - THIS IS THE FIX."""
-            url = f"{base_url}/data?graph={quote(graph_uri, safe='')}"
-            print(f"[RDF] INSERT to: {url}")
-            print(f"[RDF] Content: {len(turtle_content)} bytes")
-            resp = requests.post(
-                url,
-                data=turtle_content.encode('utf-8'),
-                headers={"Content-Type": "text/turtle; charset=utf-8"},
-                auth=auth,
-                timeout=30
-            )
-            if resp.status_code in [200, 201, 204]:
-                print(f"[RDF] ✓ Insert OK: {resp.status_code}")
-                return True
-            else:
-                print(f"[RDF] ✗ Insert FAILED: {resp.status_code}")
-                print(f"[RDF] Response: {resp.text[:500]}")
-                return False
+        turtle_lines = [PREFIXES]
+        stats = {"tables": 0, "columns": 0, "jobs": 0, "datasets": 0, 
+                 "datasources": 0, "fks": 0, "reads": 0, "writes": 0, "represents": 0,
+                 "table_fks": 0, "col_props": 0, "belongs_to": 0}
         
-        stats = {"tables": 0, "columns": 0, "fks": 0, "jobs": 0, "datasets": 0}
-        
-        # Get tables from Neo4j
-        print("[RDF] Querying Neo4j for tables...")
-        tables_result = neo4j.run_query("""
+        # 1. TABLES with columns (enhanced with more properties)
+        log("[QUERY] Fetching tables and columns with full metadata...")
+        tables = neo4j.run_query("""
             MATCH (t:Table)
+            OPTIONAL MATCH (t)-[:BELONGS_TO]->(ds:DataSource)
             OPTIONAL MATCH (t)<-[:BELONGS_TO]-(c:Column)
-            WITH t, collect({name: c.name}) as columns
-            RETURN t.name as name, columns
+            WITH t, ds, collect({
+                name: c.name, 
+                dataType: c.data_type,
+                isPK: c.is_primary_key,
+                isNullable: c.is_nullable,
+                isUnique: c.is_unique
+            }) as columns
+            RETURN t.name as name, ds.id as datasource, columns
         """)
         
-        if tables_result:
-            turtle_lines = [PREFIXES]
-            for table in tables_result:
-                table_name = table.get("name")
-                if not table_name:
-                    continue
-                table_uri = f"gwdata:table_{uri_safe(table_name)}"
-                turtle_lines.append(f'{table_uri} a gw:Table ; rdfs:label "{table_name}" .')
-                stats["tables"] += 1
-                
-                for col in table.get("columns", []):
-                    col_name = col.get("name")
-                    if col_name:
-                        col_uri = f"gwdata:column_{uri_safe(table_name)}_{uri_safe(col_name)}"
-                        turtle_lines.append(f'{col_uri} a gw:Column ; rdfs:label "{col_name}" ; gw:belongsToTable {table_uri} .')
-                        turtle_lines.append(f'{table_uri} gw:hasColumn {col_uri} .')
-                        stats["columns"] += 1
+        for table in (tables or []):
+            table_name = table.get("name")
+            if not table_name:
+                continue
+            table_uri = f"gwdata:table_{uri_safe(table_name)}"
+            ds_id = table.get("datasource") or "default"
+            ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
             
-            print(f"[RDF] Found {stats['tables']} tables, {stats['columns']} columns")
-            if not insert_turtle("\n".join(turtle_lines)):
-                return "ERROR: Failed to insert tables"
-        else:
-            print("[RDF] WARNING: No tables found in Neo4j!")
+            # Table triples with DCAT types
+            turtle_lines.append(f'{table_uri} a gw:Table, dcat:Dataset ;')
+            turtle_lines.append(f'    rdfs:label "{table_name}" ;')
+            turtle_lines.append(f'    dct:identifier "{table_name}" ;')
+            turtle_lines.append(f'    gw:belongsToDataSource {ds_uri} .')
+            stats["tables"] += 1
+            stats["belongs_to"] += 1
+            
+            for col in table.get("columns", []):
+                col_name = col.get("name") if col else None
+                if col_name:
+                    col_uri = f"gwdata:column_{uri_safe(table_name)}_{uri_safe(col_name)}"
+                    data_type = col.get("dataType") or "unknown"
+                    is_pk = col.get("isPK") or False
+                    is_nullable = col.get("isNullable")
+                    is_unique = col.get("isUnique") or False
+                    
+                    # Column triples with enhanced properties
+                    turtle_lines.append(f'{col_uri} a gw:Column ;')
+                    turtle_lines.append(f'    rdfs:label "{col_name}" ;')
+                    turtle_lines.append(f'    gw:columnName "{col_name}" ;')
+                    turtle_lines.append(f'    gw:dataType "{data_type}" ;')
+                    turtle_lines.append(f'    gw:belongsToTable {table_uri} ;')
+                    if is_pk:
+                        turtle_lines.append(f'    gw:isPrimaryKey "true"^^xsd:boolean ;')
+                        stats["col_props"] += 1
+                    if is_unique:
+                        turtle_lines.append(f'    gw:isUnique "true"^^xsd:boolean ;')
+                        stats["col_props"] += 1
+                    if is_nullable is not None:
+                        turtle_lines.append(f'    gw:isNullable "{str(is_nullable).lower()}"^^xsd:boolean ;')
+                        stats["col_props"] += 1
+                    # Remove trailing semicolon and close with period
+                    if turtle_lines[-1].endswith(' ;'):
+                        turtle_lines[-1] = turtle_lines[-1][:-2] + ' .'
+                    else:
+                        turtle_lines.append('.')
+                    
+                    turtle_lines.append(f'{table_uri} gw:hasColumn {col_uri} .')
+                    stats["columns"] += 1
         
-        # Get FKs from Neo4j
-        print("[RDF] Querying Neo4j for FK relationships...")
-        fks_result = neo4j.run_query("""
+        log(f"[TABLES] {stats['tables']} tables, {stats['columns']} columns")
+        
+        # 2. JOBS
+        log("[QUERY] Fetching jobs...")
+        jobs = neo4j.run_query("""
+            MATCH (j:Job)
+            RETURN j.name as name, j.namespace as namespace, j.description as description
+        """)
+        
+        for job in (jobs or []):
+            job_name = job.get("name")
+            if not job_name:
+                continue
+            job_uri = f"gwdata:job_{uri_safe(job_name)}"
+            ns = job.get("namespace") or "default"
+            desc = (job.get("description") or "").replace('"', '\\"')
+            turtle_lines.append(f'{job_uri} a gw:Job ; rdfs:label "{job_name}" ; gw:namespace "{ns}" .')
+            stats["jobs"] += 1
+        
+        log(f"[JOBS] {stats['jobs']} jobs")
+        
+        # 3. DATASETS
+        log("[QUERY] Fetching datasets...")
+        datasets = neo4j.run_query("""
+            MATCH (d:Dataset)
+            RETURN d.name as name, d.namespace as namespace
+        """)
+        
+        for ds in (datasets or []):
+            ds_name = ds.get("name")
+            if not ds_name:
+                continue
+            ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
+            ns = ds.get("namespace") or "default"
+            turtle_lines.append(f'{ds_uri} a gw:Dataset ; rdfs:label "{ds_name}" ; gw:namespace "{ns}" .')
+            stats["datasets"] += 1
+        
+        log(f"[DATASETS] {stats['datasets']} datasets")
+        
+        # 4. DATASOURCES
+        log("[QUERY] Fetching datasources...")
+        datasources = neo4j.run_query("MATCH (ds:DataSource) RETURN ds.id as id")
+        
+        for ds in (datasources or []):
+            ds_id = ds.get("id")
+            if ds_id:
+                ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
+                turtle_lines.append(f'{ds_uri} a gw:DataSource ; rdfs:label "{ds_id}" .')
+                stats["datasources"] += 1
+        
+        log(f"[DATASOURCES] {stats['datasources']} datasources")
+        
+        # 5. FK_TO relationships (with confidence and cardinality)
+        log("[QUERY] Fetching FK relationships...")
+        fks = neo4j.run_query("""
             MATCH (sc:Column)-[fk:FK_TO]->(tc:Column)
             MATCH (sc)-[:BELONGS_TO]->(st:Table)
             MATCH (tc)-[:BELONGS_TO]->(tt:Table)
-            RETURN st.name as source_table, sc.name as source_column,
-                   tt.name as target_table, tc.name as target_column
+            RETURN st.name as srcTable, sc.name as srcCol, 
+                   tt.name as tgtTable, tc.name as tgtCol,
+                   fk.score as confidence, fk.cardinality as cardinality
         """)
         
-        if fks_result:
-            turtle_lines = [PREFIXES]
-            for fk in fks_result:
-                src_col_uri = f"gwdata:column_{uri_safe(fk['source_table'])}_{uri_safe(fk['source_column'])}"
-                tgt_col_uri = f"gwdata:column_{uri_safe(fk['target_table'])}_{uri_safe(fk['target_column'])}"
-                turtle_lines.append(f'{src_col_uri} gw:references {tgt_col_uri} .')
-                stats["fks"] += 1
+        for fk in (fks or []):
+            src_uri = f"gwdata:column_{uri_safe(fk['srcTable'])}_{uri_safe(fk['srcCol'])}"
+            tgt_uri = f"gwdata:column_{uri_safe(fk['tgtTable'])}_{uri_safe(fk['tgtCol'])}"
+            src_table_uri = f"gwdata:table_{uri_safe(fk['srcTable'])}"
+            tgt_table_uri = f"gwdata:table_{uri_safe(fk['tgtTable'])}"
+            conf = fk.get("confidence") or 1.0
+            card = fk.get("cardinality") or "unknown"
             
-            print(f"[RDF] Found {stats['fks']} FK relationships")
-            insert_turtle("\n".join(turtle_lines))
+            # Column-to-Column FK with metadata
+            turtle_lines.append(f'{src_uri} gw:referencesColumn {tgt_uri} .')
+            turtle_lines.append(f'{src_uri} gw:fkConfidence "{conf}"^^xsd:float .')
+            turtle_lines.append(f'{src_uri} gw:fkCardinality "{card}" .')
+            
+            # Table-to-Table FK (bidirectional for easier querying)
+            turtle_lines.append(f'{src_table_uri} gw:referencesTable {tgt_table_uri} .')
+            turtle_lines.append(f'{tgt_table_uri} gw:referencedByTable {src_table_uri} .')
+            stats["table_fks"] += 1
+            
+            stats["fks"] += 1
         
-        # Get Jobs from Neo4j
-        print("[RDF] Querying Neo4j for jobs...")
-        jobs_result = neo4j.run_query("""
-            MATCH (j:Job)
-            OPTIONAL MATCH (j)-[:READS]->(input:Dataset)
-            OPTIONAL MATCH (j)-[:WRITES]->(output:Dataset)
-            WITH j, collect(DISTINCT input.name) as inputs, collect(DISTINCT output.name) as outputs
-            RETURN j.name as name, inputs, outputs
+        log(f"[FKs] {stats['fks']} column FKs, {stats['table_fks']} table FKs")
+        
+        # 6. READS relationships
+        log("[QUERY] Fetching READS relationships...")
+        reads = neo4j.run_query("""
+            MATCH (j:Job)-[:READS]->(d:Dataset)
+            RETURN j.name as job, d.name as dataset
         """)
         
-        if jobs_result:
-            turtle_lines = [PREFIXES]
-            dataset_names = set()
-            for job in jobs_result:
-                job_name = job.get("name")
-                if not job_name:
-                    continue
-                job_uri = f"gwdata:job_{uri_safe(job_name)}"
-                turtle_lines.append(f'{job_uri} a gw:Job ; rdfs:label "{job_name}" .')
-                stats["jobs"] += 1
-                
-                for ds_name in job.get("inputs", []):
-                    if ds_name:
-                        ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
-                        if ds_name not in dataset_names:
-                            turtle_lines.append(f'{ds_uri} a gw:Dataset ; rdfs:label "{ds_name}" .')
-                            dataset_names.add(ds_name)
-                        turtle_lines.append(f'{job_uri} gw:readsFrom {ds_uri} .')
-                
-                for ds_name in job.get("outputs", []):
-                    if ds_name:
-                        ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
-                        if ds_name not in dataset_names:
-                            turtle_lines.append(f'{ds_uri} a gw:Dataset ; rdfs:label "{ds_name}" .')
-                            dataset_names.add(ds_name)
-                        turtle_lines.append(f'{job_uri} gw:writesTo {ds_uri} .')
-            
-            stats["datasets"] = len(dataset_names)
-            print(f"[RDF] Found {stats['jobs']} jobs, {stats['datasets']} datasets")
-            insert_turtle("\n".join(turtle_lines))
+        for r in (reads or []):
+            job_uri = f"gwdata:job_{uri_safe(r['job'])}"
+            ds_uri = f"gwdata:dataset_{uri_safe(r['dataset'])}"
+            turtle_lines.append(f'{job_uri} gw:readsDataset {ds_uri} .')
+            stats["reads"] += 1
         
-        # Get Dataset-Table REPRESENTS relationships
-        print("[RDF] Querying Neo4j for REPRESENTS relationships...")
-        represents_result = neo4j.run_query("""
+        log(f"[READS] {stats['reads']} READS relationships")
+        
+        # 7. WRITES relationships
+        log("[QUERY] Fetching WRITES relationships...")
+        writes = neo4j.run_query("""
+            MATCH (j:Job)-[:WRITES]->(d:Dataset)
+            RETURN j.name as job, d.name as dataset
+        """)
+        
+        for w in (writes or []):
+            job_uri = f"gwdata:job_{uri_safe(w['job'])}"
+            ds_uri = f"gwdata:dataset_{uri_safe(w['dataset'])}"
+            turtle_lines.append(f'{job_uri} gw:writesDataset {ds_uri} .')
+            stats["writes"] += 1
+        
+        log(f"[WRITES] {stats['writes']} WRITES relationships")
+        
+        # 8. REPRESENTS relationships
+        log("[QUERY] Fetching REPRESENTS relationships...")
+        represents = neo4j.run_query("""
             MATCH (d:Dataset)-[:REPRESENTS]->(t:Table)
             RETURN d.name as dataset, t.name as table
         """)
         
-        stats["represents"] = 0
-        if represents_result:
-            turtle_lines = [PREFIXES]
-            for rep in represents_result:
-                ds_name = rep.get("dataset")
-                table_name = rep.get("table")
-                if ds_name and table_name:
-                    ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
-                    table_uri = f"gwdata:table_{uri_safe(table_name)}"
-                    turtle_lines.append(f'{ds_uri} gw:representsTable {table_uri} .')
-                    stats["represents"] += 1
-            
-            print(f"[RDF] Found {stats['represents']} REPRESENTS relationships")
-            if stats["represents"] > 0:
-                insert_turtle("\n".join(turtle_lines))
+        for rep in (represents or []):
+            ds_uri = f"gwdata:dataset_{uri_safe(rep['dataset'])}"
+            table_uri = f"gwdata:table_{uri_safe(rep['table'])}"
+            turtle_lines.append(f'{ds_uri} gw:representsTable {table_uri} .')
+            stats["represents"] += 1
         
-        # Get triple count
-        count_query = f"SELECT (COUNT(*) as ?count) WHERE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}"
-        count_resp = requests.post(
-            f"{base_url}/sparql",
-            data={"query": count_query},
-            headers={"Accept": "application/sparql-results+json"},
-            timeout=30
-        )
-        total_triples = 0
-        if count_resp.status_code == 200:
-            try:
+        log(f"[REPRESENTS] {stats['represents']} REPRESENTS relationships")
+        
+        # Build and insert Turtle
+        turtle_content = "\n".join(turtle_lines)
+        log(f"[TURTLE] Total size: {len(turtle_content)} bytes")
+        
+        insert_url = f"{base_url}/data?graph={quote(graph_uri, safe='')}"
+        log(f"[INSERT] URL: {insert_url}")
+        
+        try:
+            insert_resp = requests.post(
+                insert_url,
+                data=turtle_content.encode('utf-8'),
+                headers={"Content-Type": "text/turtle; charset=utf-8"},
+                auth=auth,
+                timeout=60
+            )
+            log(f"[INSERT] Response: {insert_resp.status_code}")
+            
+            if insert_resp.status_code not in [200, 201, 204]:
+                return f"ERROR: Insert failed: {insert_resp.status_code}\n{insert_resp.text}"
+            log("[INSERT] ✓ Success")
+        except Exception as e:
+            return f"ERROR: Insert failed: {e}"
+        
+        # Count triples
+        try:
+            count_resp = requests.post(
+                f"{base_url}/sparql",
+                data={"query": f"SELECT (COUNT(*) as ?count) WHERE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}"},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout=30
+            )
+            total_triples = 0
+            if count_resp.status_code == 200:
                 bindings = count_resp.json().get("results", {}).get("bindings", [])
                 if bindings:
                     total_triples = int(bindings[0].get("count", {}).get("value", 0))
-            except:
-                pass
+            log(f"[COUNT] ★ Total triples: {total_triples}")
+        except Exception as e:
+            log(f"[COUNT] Error: {e}")
+            total_triples = sum(stats.values())
         
-        print(f"[RDF] Total triples in graph: {total_triples}")
-        print("=" * 60)
+        log("=" * 70)
+        log(f"  SYNC COMPLETE: {total_triples} triples")
+        log("=" * 70)
         
-        output = "## RDF Sync Complete\n\n"
-        output += f"- Tables synced: {stats['tables']}\n"
-        output += f"- Columns synced: {stats['columns']}\n"
-        output += f"- Foreign keys synced: {stats['fks']}\n"
-        output += f"- Jobs synced: {stats['jobs']}\n"
-        output += f"- Datasets synced: {stats['datasets']}\n"
-        output += f"- Dataset-Table links: {stats.get('represents', 0)}\n"
-        output += f"- **Total triples: {total_triples}**\n"
-        output += "\nYou can now query the RDF store with SPARQL or access it at http://localhost:3030"
+        # Build output
+        output = "## ★ Graph Synced to RDF ★\n\n"
+        output += "### Nodes Synced:\n"
+        output += f"- Tables: {stats['tables']}\n"
+        output += f"- Columns: {stats['columns']} (with {stats.get('col_props', 0)} extra properties)\n"
+        output += f"- Jobs: {stats['jobs']}\n"
+        output += f"- Datasets: {stats['datasets']}\n"
+        output += f"- DataSources: {stats['datasources']}\n\n"
+        output += "### Relationships Synced:\n"
+        output += f"- Column FK references: {stats['fks']}\n"
+        output += f"- Table FK references: {stats['table_fks']}\n"
+        output += f"- Table-DataSource: {stats['belongs_to']}\n"
+        output += f"- READS (lineage): {stats['reads']}\n"
+        output += f"- WRITES (lineage): {stats['writes']}\n"
+        output += f"- REPRESENTS: {stats['represents']}\n\n"
+        output += f"**Total RDF triples: {total_triples}**\n"
         
         return output
+        
     except Exception as e:
         import traceback
-        return f"ERROR syncing to RDF: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        return f"ERROR: {e}\n\nDebug:\n" + "\n".join(debug_log) + f"\n\n{traceback.format_exc()}"
 
 
 @tool
