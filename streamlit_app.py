@@ -1,15 +1,37 @@
+#!/usr/bin/env python3
+# =============================================================================
+# FILE: streamlit_app.py
+# PATH: /home/gp/Downloads/graphweaver-agent/streamlit_app.py
+# =============================================================================
 """
 graphweaver-agent/streamlit_app.py
 
 Streamlit Chat Interface for GraphWeaver Agent with Real-Time Streaming
+
+WITH TERMINAL DEBUG LOGGING - Run with: DEBUG=1 streamlit run streamlit_app.py
 """
 import os
 import sys
 import streamlit as st
 from typing import Optional, Generator, Dict, Any, List
 import anthropic
+import time
 
-# Add paths
+# =============================================================================
+# DEBUG LOGGING SETUP
+# =============================================================================
+os.environ['PYTHONUNBUFFERED'] = '1'
+
+from debug_logger import DebugLogger, debug, debug_tool, APIStreamLogger, Colors
+
+DEBUG_MODE = os.environ.get("DEBUG", "0").lower() in ("1", "true", "yes")
+if DEBUG_MODE:
+    DebugLogger.enable(verbose=True, log_file="agent_debug.log")
+
+# =============================================================================
+# Original imports
+# =============================================================================
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mcp_servers"))
 
@@ -28,13 +50,11 @@ from graphweaver_agent.business_rules import (
     import_lineage_to_neo4j, generate_sample_rules,
 )
 
-# RDF imports
 from graphweaver_agent.rdf import (
     FusekiClient, RDFSyncManager, sync_neo4j_to_rdf,
     GraphWeaverOntology, SPARQLQueryBuilder, PREFIXES_SPARQL
 )
 
-# LTN imports
 try:
     from graphweaver_agent.ltn import (
         LTNRuleLearner,
@@ -45,10 +65,9 @@ try:
         RuleLearningConfig,
     )
     LTN_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):
     LTN_AVAILABLE = False
 
-# Dynamic Tools imports
 from graphweaver_agent.dynamic_tools.agent_tools import (
     check_tool_exists,
     list_available_tools,
@@ -81,11 +100,10 @@ Be helpful, thorough, and explain what you're doing. When discovering FKs, valid
 
 
 # =============================================================================
-# Streaming Tool Definitions (JSON schema format for Anthropic API)
+# Streaming Tool Definitions
 # =============================================================================
 
 STREAMING_TOOLS = [
-    # Dynamic tool management
     {"name": "check_tool_exists", "description": "Check if a dynamic tool exists in the registry",
      "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string", "description": "Name of the tool to check"}}, "required": ["tool_name"]}},
     {"name": "list_available_tools", "description": "List all available tools - both builtin and dynamic",
@@ -100,8 +118,6 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string"}, "code": {"type": "string"}, "description": {"type": "string"}}, "required": ["tool_name", "code"]}},
     {"name": "delete_dynamic_tool", "description": "Delete a dynamic tool",
      "input_schema": {"type": "object", "properties": {"tool_name": {"type": "string"}}, "required": ["tool_name"]}},
-
-    # Database
     {"name": "configure_database", "description": "Configure which PostgreSQL database to connect to",
      "input_schema": {"type": "object", "properties": {"host": {"type": "string"}, "port": {"type": "integer"}, "database": {"type": "string"}, "username": {"type": "string"}, "password": {"type": "string"}}, "required": ["host", "port", "database", "username", "password"]}},
     {"name": "test_database_connection", "description": "Test the PostgreSQL database connection",
@@ -112,16 +128,12 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
     {"name": "get_column_stats", "description": "Get statistics for a column (uniqueness, nulls, samples)",
      "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}, "column_name": {"type": "string"}}, "required": ["table_name", "column_name"]}},
-
-    # FK Discovery
     {"name": "run_fk_discovery", "description": "Run the full 5-stage FK discovery pipeline on the database",
      "input_schema": {"type": "object", "properties": {"min_match_rate": {"type": "number", "default": 0.95}, "min_score": {"type": "number", "default": 0.5}}}},
     {"name": "analyze_potential_fk", "description": "Analyze a potential FK relationship and get a score",
      "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "source_column": {"type": "string"}, "target_table": {"type": "string"}, "target_column": {"type": "string"}}, "required": ["source_table", "source_column", "target_table", "target_column"]}},
     {"name": "validate_fk_with_data", "description": "Validate a FK by checking actual data integrity",
      "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "source_column": {"type": "string"}, "target_table": {"type": "string"}, "target_column": {"type": "string"}}, "required": ["source_table", "source_column", "target_table", "target_column"]}},
-
-    # Graph
     {"name": "clear_neo4j_graph", "description": "Clear all nodes and relationships from Neo4j",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "add_fk_to_graph", "description": "Add a FK relationship to the Neo4j graph",
@@ -138,8 +150,6 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "connect_datasets_to_tables", "description": "Connect Dataset nodes to their matching Table nodes",
      "input_schema": {"type": "object", "properties": {}}},
-
-    # Embeddings
     {"name": "generate_text_embeddings", "description": "Generate text embeddings for all tables, columns, jobs, and datasets",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "generate_kg_embeddings", "description": "Generate knowledge graph embeddings using Neo4j GDS FastRP",
@@ -158,8 +168,6 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {"threshold": {"type": "number", "default": 0.7}, "top_k": {"type": "integer", "default": 20}}}},
     {"name": "semantic_fk_discovery", "description": "Discover FKs using semantic similarity",
      "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "min_score": {"type": "number", "default": 0.6}}}},
-
-    # Business Rules
     {"name": "show_sample_business_rules", "description": "Show sample business rules YAML format",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "load_business_rules", "description": "Load business rules from YAML content",
@@ -182,8 +190,6 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
     {"name": "find_impact_analysis", "description": "Find what tables would be impacted by changes",
      "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
-
-    # RDF/SPARQL
     {"name": "test_rdf_connection", "description": "Test connection to Apache Jena Fuseki",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "sync_graph_to_rdf", "description": "Sync Neo4j graph to RDF triple store",
@@ -208,8 +214,6 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "export_rdf_turtle", "description": "Export RDF data as Turtle",
      "input_schema": {"type": "object", "properties": {}}},
-
-    # LTN
     {"name": "learn_rules_with_ltn", "description": "Learn rules using Logic Tensor Networks",
      "input_schema": {"type": "object", "properties": {"epochs": {"type": "integer", "default": 100}}}},
     {"name": "generate_business_rules_from_ltn", "description": "Generate business rules from LTN learned patterns",
@@ -226,13 +230,13 @@ STREAMING_TOOLS = [
 
 
 # =============================================================================
-# Global State Accessors
+# Global State Accessors with Debug Logging
 # =============================================================================
 
 def get_pg_config() -> DataSourceConfig:
-    """Get PostgreSQL config from session state."""
+    debug.postgres("Getting PostgreSQL config...")
     from graphweaver_agent.models import DatabaseType
-    return DataSourceConfig(
+    config = DataSourceConfig(
         host=st.session_state.get("pg_host", os.environ.get("POSTGRES_HOST", "localhost")),
         port=int(st.session_state.get("pg_port", os.environ.get("POSTGRES_PORT", "5432"))),
         database=st.session_state.get("pg_database", os.environ.get("POSTGRES_DB", "orders")),
@@ -241,17 +245,20 @@ def get_pg_config() -> DataSourceConfig:
         db_type=DatabaseType.POSTGRESQL,
         schema_name=st.session_state.get("pg_schema", "public"),
     )
+    debug.postgres(f"Config: {config.host}:{config.port}/{config.database}")
+    return config
 
 
 def get_pg() -> PostgreSQLConnector:
-    """Get or create PostgreSQL connector."""
     if "pg_connector" not in st.session_state:
+        debug.postgres("Creating new PostgreSQL connector...")
         st.session_state.pg_connector = PostgreSQLConnector(get_pg_config())
+        debug.postgres("✓ PostgreSQL connector created")
     return st.session_state.pg_connector
 
 
 def get_neo4j_config() -> Neo4jConfig:
-    """Get Neo4j config from session state."""
+    debug.neo4j("Getting Neo4j config...")
     return Neo4jConfig(
         uri=st.session_state.get("neo4j_uri", os.environ.get("NEO4J_URI", "bolt://localhost:7687")),
         username=st.session_state.get("neo4j_user", os.environ.get("NEO4J_USER", "neo4j")),
@@ -261,81 +268,73 @@ def get_neo4j_config() -> Neo4jConfig:
 
 
 def get_neo4j() -> Neo4jClient:
-    """Get or create Neo4j client."""
     if "neo4j_client" not in st.session_state:
-        st.session_state.neo4j_client = Neo4jClient(get_neo4j_config())
+        config = get_neo4j_config()
+        debug.neo4j(f"Creating Neo4j client: {config.uri}")
+        try:
+            st.session_state.neo4j_client = Neo4jClient(config)
+            debug.neo4j("✓ Neo4j client created")
+        except Exception as e:
+            debug.error(f"Failed to create Neo4j client: {e}", e)
+            raise
     return st.session_state.neo4j_client
 
 
 def get_text_embedder():
-    """Get or create text embedder."""
     if "text_embedder" not in st.session_state:
+        debug.embedding("Loading text embedder model...")
         from graphweaver_agent.embeddings import TextEmbedder
         st.session_state.text_embedder = TextEmbedder()
+        debug.embedding("✓ Text embedder loaded")
     return st.session_state.text_embedder
 
 
 def get_fuseki() -> FusekiClient:
-    """Get or create Fuseki client."""
     if "fuseki_client" not in st.session_state:
+        debug.api("Creating Fuseki client...")
         st.session_state.fuseki_client = FusekiClient()
     return st.session_state.fuseki_client
 
 
 def get_sparql() -> SPARQLQueryBuilder:
-    """Get or create SPARQL query builder."""
     if "sparql_builder" not in st.session_state:
         st.session_state.sparql_builder = SPARQLQueryBuilder(get_fuseki())
     return st.session_state.sparql_builder
 
 
 def get_marquez() -> MarquezClient:
-    """Get or create Marquez client."""
     if "marquez_client" not in st.session_state:
-        st.session_state.marquez_client = MarquezClient(
-            url=os.environ.get("MARQUEZ_URL", "http://localhost:5000")
-        )
+        marquez_url = os.environ.get("MARQUEZ_URL", "http://localhost:5000")
+        debug.api(f"Creating Marquez client: {marquez_url}")
+        st.session_state.marquez_client = MarquezClient(marquez_url)
     return st.session_state.marquez_client
 
 
 def get_rule_learner():
-    """Get or create LTN rule learner."""
-    if "rule_learner" not in st.session_state:
-        if not LTN_AVAILABLE:
-            return None
-        config = RuleLearningConfig(
-            embedding_dim=384,
-            use_text_embeddings=True,
-            use_kg_embeddings=True,
-        )
-        st.session_state.rule_learner = LTNRuleLearner(get_neo4j(), config)
-    return st.session_state.rule_learner
+    if "rule_learner" not in st.session_state and LTN_AVAILABLE:
+        debug.agent("Creating LTN rule learner...")
+        st.session_state.rule_learner = LTNRuleLearner(get_neo4j())
+    return st.session_state.get("rule_learner")
 
 
 def get_rule_generator():
-    """Get or create business rule generator."""
-    if "rule_generator" not in st.session_state:
-        if not LTN_AVAILABLE:
-            return None
+    if "rule_generator" not in st.session_state and LTN_AVAILABLE:
         st.session_state.rule_generator = BusinessRuleGenerator(get_neo4j())
-    return st.session_state.rule_generator
+    return st.session_state.get("rule_generator")
 
 
 def get_registry():
-    """Get the dynamic tool registry."""
     if "tool_registry" not in st.session_state:
-        from graphweaver_agent.dynamic_tools.tool_registry import ToolRegistry
-        st.session_state.tool_registry = ToolRegistry(
-            os.environ.get("DYNAMIC_TOOLS_DIR",
-                          os.path.join(os.path.dirname(__file__), "dynamic_tools"))
-        )
+        from graphweaver_agent.dynamic_tools import DynamicToolRegistry
+        st.session_state.tool_registry = DynamicToolRegistry()
     return st.session_state.tool_registry
 
 
 # =============================================================================
-# Tool Implementation Functions
+# Tool Implementations with Debug Logging
 # =============================================================================
 
+@debug_tool
 def impl_configure_database(host: str, port: int, database: str, username: str, password: str) -> str:
     st.session_state.pg_host = host
     st.session_state.pg_port = port
@@ -347,6 +346,7 @@ def impl_configure_database(host: str, port: int, database: str, username: str, 
     return f"✓ Configured database: {username}@{host}:{port}/{database}"
 
 
+@debug_tool
 def impl_test_database_connection() -> str:
     result = get_pg().test_connection()
     if result["success"]:
@@ -354,6 +354,7 @@ def impl_test_database_connection() -> str:
     return f"✗ Failed: {result['error']}"
 
 
+@debug_tool
 def impl_list_database_tables() -> str:
     tables = get_pg().get_tables_with_info()
     output = "Tables:\n"
@@ -362,6 +363,7 @@ def impl_list_database_tables() -> str:
     return output
 
 
+@debug_tool
 def impl_get_table_schema(table_name: str) -> str:
     schema = get_pg().get_table_schema(table_name)
     if not schema:
@@ -376,6 +378,7 @@ def impl_get_table_schema(table_name: str) -> str:
     return output
 
 
+@debug_tool
 def impl_get_column_stats(table_name: str, column_name: str) -> str:
     stats = get_pg().get_column_statistics(table_name, column_name)
     output = f"Stats for {table_name}.{column_name}:\n"
@@ -386,10 +389,13 @@ def impl_get_column_stats(table_name: str, column_name: str) -> str:
     return output
 
 
+@debug_tool
 def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) -> str:
-    """Run FK discovery pipeline AND persist results to Neo4j."""
+    debug.section("FK DISCOVERY PIPELINE")
     try:
         pg_config = get_pg_config()
+        debug.agent(f"Running FK discovery on {pg_config.database}...")
+        
         result = run_discovery(
             host=pg_config.host,
             port=pg_config.port,
@@ -402,6 +408,8 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
         )
         
         summary = result["summary"]
+        debug.agent(f"Discovery complete: {summary['final_fks_discovered']} FKs found")
+        
         output = "## FK Discovery Results\n\n"
         output += f"- Tables scanned: {summary['tables_scanned']}\n"
         output += f"- Total columns: {summary['total_columns']}\n"
@@ -409,13 +417,15 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
         output += f"- **Final FKs discovered: {summary['final_fks_discovered']}**\n"
         output += f"- Duration: {summary['duration_seconds']}s\n\n"
         
-        # PERSIST TO NEO4J - THIS WAS THE MISSING FIX!
         discovered_fks = result.get("discovered_fks", [])
         
         if discovered_fks:
+            debug.subsection("Persisting to Neo4j")
             try:
                 neo4j = get_neo4j()
                 builder = GraphBuilder(neo4j)
+                
+                debug.neo4j("Clearing existing graph...")
                 builder.clear_graph()
                 
                 tables_added = set()
@@ -440,6 +450,8 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
                         confidence = fk.get("score", fk.get("confidence", 1.0))
                         cardinality = fk.get("cardinality", "1:N")
                     
+                    debug.neo4j(f"Adding FK: {src_table}.{src_col} → {tgt_table}.{tgt_col}")
+                    
                     if src_table and src_table not in tables_added:
                         builder.add_table(src_table)
                         tables_added.add(src_table)
@@ -458,7 +470,10 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
                 output += f"- Tables added: {len(tables_added)}\n"
                 output += f"- FK relationships added: {fks_added}\n\n"
                 
+                debug.neo4j(f"✓ Persisted {fks_added} FKs, {len(tables_added)} tables")
+                
             except Exception as e:
+                debug.error(f"Neo4j persistence failed: {e}", e)
                 import traceback
                 output += f"### ⚠ Neo4j Error: {e}\n"
                 output += f"```\n{traceback.format_exc()}\n```\n\n"
@@ -483,12 +498,13 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
         return output
         
     except Exception as e:
+        debug.error(f"FK discovery failed: {e}", e)
         import traceback
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_analyze_potential_fk(source_table: str, source_column: str, target_table: str, target_column: str) -> str:
-    """Analyze if a column pair could be a FK."""
     pg = get_pg()
     
     try:
@@ -534,6 +550,7 @@ def impl_analyze_potential_fk(source_table: str, source_column: str, target_tabl
         return f"Error: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_validate_fk_with_data(source_table: str, source_column: str, target_table: str, target_column: str) -> str:
     pg = get_pg()
     result = pg.validate_fk(source_table, source_column, target_table, target_column)
@@ -551,12 +568,16 @@ def impl_validate_fk_with_data(source_table: str, source_column: str, target_tab
     return output
 
 
+@debug_tool
 def impl_clear_neo4j_graph() -> str:
+    debug.neo4j("Clearing Neo4j graph...")
     neo4j = get_neo4j()
     neo4j.run_write("MATCH (n) DETACH DELETE n")
+    debug.neo4j("✓ Graph cleared")
     return "✓ Neo4j graph cleared"
 
 
+@debug_tool
 def impl_add_fk_to_graph(source_table: str, source_column: str, target_table: str, target_column: str, score: float = 1.0, cardinality: str = "1:N") -> str:
     builder = GraphBuilder(get_neo4j())
     builder.add_table(source_table)
@@ -565,13 +586,19 @@ def impl_add_fk_to_graph(source_table: str, source_column: str, target_table: st
     return f"✓ Added: {source_table}.{source_column} → {target_table}.{target_column}"
 
 
+@debug_tool
 def impl_get_graph_stats() -> str:
+    debug.neo4j("Getting graph statistics...")
     stats = GraphAnalyzer(get_neo4j()).get_statistics()
+    debug.neo4j(f"Stats: {stats}")
     return f"Graph: {stats['tables']} tables, {stats['columns']} columns, {stats['fks']} FKs"
 
 
+@debug_tool
 def impl_analyze_graph_centrality() -> str:
+    debug.neo4j("Analyzing graph centrality...")
     result = GraphAnalyzer(get_neo4j()).centrality_analysis()
+    debug.neo4j(f"Centrality result: {result}")
     output = "Centrality Analysis:\n"
     output += f"  Hub tables (fact/transaction): {result['hub_tables']}\n"
     output += f"  Authority tables (dimension): {result['authority_tables']}\n"
@@ -579,6 +606,7 @@ def impl_analyze_graph_centrality() -> str:
     return output
 
 
+@debug_tool
 def impl_find_table_communities() -> str:
     communities = GraphAnalyzer(get_neo4j()).community_detection()
     if not communities:
@@ -589,6 +617,7 @@ def impl_find_table_communities() -> str:
     return output
 
 
+@debug_tool
 def impl_predict_missing_fks() -> str:
     predictions = GraphAnalyzer(get_neo4j()).predict_missing_fks()
     if not predictions:
@@ -599,10 +628,13 @@ def impl_predict_missing_fks() -> str:
     return output
 
 
+@debug_tool
 def impl_run_cypher(query: str) -> str:
+    debug.neo4j(f"Executing Cypher query:\n{query}")
     neo4j = get_neo4j()
     try:
         results = neo4j.run_query(query)
+        debug.neo4j(f"Query returned {len(results) if results else 0} rows")
         if not results:
             return "Query executed successfully. No results returned."
         output = f"Results ({len(results)} rows):\n"
@@ -612,6 +644,7 @@ def impl_run_cypher(query: str) -> str:
             output += f"  ... and {len(results) - 50} more rows"
         return output
     except Exception as e:
+        debug.error(f"Cypher query failed: {e}", e)
         try:
             neo4j.run_write(query)
             return "Write query executed successfully."
@@ -619,7 +652,9 @@ def impl_run_cypher(query: str) -> str:
             return f"Error: {e2}"
 
 
+@debug_tool
 def impl_connect_datasets_to_tables() -> str:
+    debug.neo4j("Connecting datasets to tables...")
     neo4j = get_neo4j()
     result = neo4j.run_query("""
         MATCH (d:Dataset)
@@ -630,43 +665,84 @@ def impl_connect_datasets_to_tables() -> str:
     """)
     if not result:
         return "No matching Dataset-Table pairs found."
-    output = f"Connected {len(result)} Datasets to Tables\n"
+    output = f"## Dataset-Table Connections\n\n**Connected {len(result)} datasets to tables:**\n"
     for row in result:
-        output += f"  Dataset '{row['dataset']}' → Table '{row['table']}'\n"
+        output += f"- {row['dataset']} → {row['table']}\n"
     return output
 
 
+@debug_tool
 def impl_generate_text_embeddings() -> str:
+    debug.embedding("Generating text embeddings...")
     try:
         from graphweaver_agent.embeddings.text_embeddings import embed_all_metadata
-        stats = embed_all_metadata(
+        result = embed_all_metadata(
             neo4j_client=get_neo4j(),
             pg_connector=get_pg(),
             embedder=get_text_embedder(),
         )
-        output = "## Text Embeddings Generated\n"
-        output += f"- Tables embedded: {stats['tables']}\n"
-        output += f"- Columns embedded: {stats['columns']}\n"
-        output += f"- Jobs embedded: {stats['jobs']}\n"
-        output += f"- Datasets embedded: {stats['datasets']}\n"
+        debug.embedding(f"Embedding result: {result}")
+        
+        # Handle error response
+        if "error" in result:
+            return f"ERROR: {result['error']}\nStats: {result.get('stats', {})}"
+        
+        # Handle warning response
+        if "warning" in result:
+            return f"WARNING: {result['warning']}\nStats: {result.get('stats', {})}"
+        
+        # Success - extract stats (they're at top level from to_dict())
+        tables = result.get('tables', 0)
+        columns = result.get('columns', 0)
+        jobs = result.get('jobs', 0)
+        datasets = result.get('datasets', 0)
+        errors = result.get('errors', [])
+        
+        output = "## Text Embeddings Generated\n\n"
+        output += f"### ✓ Table embeddings: {tables}\n"
+        output += f"### ✓ Column embeddings: {columns}\n"
+        output += f"### ✓ Job embeddings: {jobs}\n"
+        output += f"### ✓ Dataset embeddings: {datasets}\n"
+        output += f"\n**Total embeddings generated: {tables + columns + jobs + datasets}**\n"
+        
+        if errors:
+            output += f"\n### ⚠ Errors ({len(errors)}):\n"
+            for err in errors[:5]:
+                output += f"- {err}\n"
+            if len(errors) > 5:
+                output += f"- ... and {len(errors) - 5} more errors\n"
+        
         return output
     except Exception as e:
+        debug.error(f"Embedding generation failed: {e}", e)
         import traceback
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_generate_kg_embeddings() -> str:
+    debug.embedding("Generating KG embeddings with Neo4j GDS...")
+    debug.neo4j("Creating graph projection for FastRP...")
     try:
         from graphweaver_agent.embeddings.kg_embeddings import generate_all_kg_embeddings
         stats = generate_all_kg_embeddings(get_neo4j())
-        output = "## KG Embeddings Generated\n"
-        output += f"- Nodes embedded: {stats.get('nodes_embedded', 'unknown')}\n"
+        debug.embedding(f"KG embedding stats: {stats}")
+        output = "## Knowledge Graph Embeddings Generated\n\n"
+        output += f"### ✓ Graph projection created: 'graphweaver-kg'\n"
+        output += f"- Nodes: {stats.get('node_count', 'unknown')}\n"
+        output += f"- Relationships: {stats.get('relationship_count', 'unknown')}\n"
+        output += f"\n### ✓ FastRP embeddings computed\n"
+        output += f"- Embedding dimension: 128\n"
+        output += f"\n### ✓ Embeddings stored as node properties\n"
+        output += f"\n**Knowledge graph embeddings ready for similarity analysis!**\n"
         return output
     except Exception as e:
+        debug.error(f"KG embedding generation failed: {e}", e)
         import traceback
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_create_vector_indexes() -> str:
     try:
         from graphweaver_agent.embeddings.vector_indexes import create_all_indexes
@@ -676,6 +752,7 @@ def impl_create_vector_indexes() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_semantic_search_tables(query: str, top_k: int = 5) -> str:
     try:
         from graphweaver_agent.embeddings.text_embeddings import search_tables
@@ -690,6 +767,7 @@ def impl_semantic_search_tables(query: str, top_k: int = 5) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_semantic_search_columns(query: str, top_k: int = 10) -> str:
     try:
         from graphweaver_agent.embeddings.text_embeddings import search_columns
@@ -704,6 +782,7 @@ def impl_semantic_search_columns(query: str, top_k: int = 10) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_find_similar_tables(table_name: str, top_k: int = 5) -> str:
     try:
         from graphweaver_agent.embeddings.text_embeddings import find_similar_tables
@@ -718,6 +797,7 @@ def impl_find_similar_tables(table_name: str, top_k: int = 5) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_find_similar_columns(table_name: str, column_name: str, top_k: int = 10) -> str:
     try:
         from graphweaver_agent.embeddings.text_embeddings import find_similar_columns
@@ -732,6 +812,7 @@ def impl_find_similar_columns(table_name: str, column_name: str, top_k: int = 10
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_predict_fks_from_embeddings(threshold: float = 0.7, top_k: int = 20) -> str:
     try:
         from graphweaver_agent.embeddings.semantic_fk import predict_fks_from_embeddings
@@ -746,6 +827,7 @@ def impl_predict_fks_from_embeddings(threshold: float = 0.7, top_k: int = 20) ->
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_semantic_fk_discovery(source_table: str = None, min_score: float = 0.6) -> str:
     try:
         from graphweaver_agent.embeddings.semantic_fk import SemanticFKDiscovery
@@ -761,10 +843,12 @@ def impl_semantic_fk_discovery(source_table: str = None, min_score: float = 0.6)
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_show_sample_business_rules() -> str:
     return generate_sample_rules()
 
 
+@debug_tool
 def impl_load_business_rules(yaml_content: str) -> str:
     import yaml
     try:
@@ -792,6 +876,7 @@ def impl_load_business_rules(yaml_content: str) -> str:
         return f"ERROR loading rules: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_load_business_rules_from_file(file_path: str = "business_rules.yaml") -> str:
     try:
         with open(file_path, 'r') as f:
@@ -803,6 +888,7 @@ def impl_load_business_rules_from_file(file_path: str = "business_rules.yaml") -
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_list_business_rules() -> str:
     if "rules_config" not in st.session_state or not st.session_state.rules_config.rules:
         return "No business rules loaded. Use load_business_rules or load_business_rules_from_file first."
@@ -814,6 +900,7 @@ def impl_list_business_rules() -> str:
     return output
 
 
+@debug_tool
 def impl_execute_business_rule(rule_name: str, capture_lineage: bool = True) -> str:
     if "rules_config" not in st.session_state:
         return "No business rules loaded."
@@ -826,7 +913,7 @@ def impl_execute_business_rule(rule_name: str, capture_lineage: bool = True) -> 
     
     try:
         marquez_url = os.environ.get("MARQUEZ_URL", "http://localhost:5000") if capture_lineage else None
-        executor = BusinessRulesExecutor(get_pg(), marquez_url) if marquez_url else BusinessRulesExecutor(get_pg(), "http://localhost:5000")
+        executor = BusinessRulesExecutor(get_pg(), marquez_url)
         result = executor.execute_rule(rule, emit_lineage=capture_lineage)
         
         output = f"## Executed: {rule_name}\n"
@@ -839,6 +926,7 @@ def impl_execute_business_rule(rule_name: str, capture_lineage: bool = True) -> 
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_execute_all_business_rules(capture_lineage: bool = True) -> str:
     if "rules_config" not in st.session_state or not st.session_state.rules_config.rules:
         return "No business rules loaded."
@@ -861,6 +949,7 @@ def impl_execute_all_business_rules(capture_lineage: bool = True) -> str:
     return output
 
 
+@debug_tool
 def impl_get_marquez_lineage(dataset_name: str, depth: int = 3) -> str:
     try:
         lineage = get_marquez().get_lineage(dataset_name, depth)
@@ -869,6 +958,7 @@ def impl_get_marquez_lineage(dataset_name: str, depth: int = 3) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_list_marquez_jobs() -> str:
     try:
         jobs = get_marquez().list_jobs()
@@ -882,6 +972,7 @@ def impl_list_marquez_jobs() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_import_lineage_to_graph() -> str:
     try:
         stats = import_lineage_to_neo4j(get_marquez(), get_neo4j())
@@ -895,6 +986,7 @@ def impl_import_lineage_to_graph() -> str:
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_analyze_data_flow(table_name: str) -> str:
     try:
         analyzer = GraphAnalyzer(get_neo4j())
@@ -911,6 +1003,7 @@ def impl_analyze_data_flow(table_name: str) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_find_impact_analysis(table_name: str) -> str:
     try:
         analyzer = GraphAnalyzer(get_neo4j())
@@ -924,6 +1017,7 @@ def impl_find_impact_analysis(table_name: str) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_test_rdf_connection() -> str:
     try:
         fuseki = get_fuseki()
@@ -934,6 +1028,7 @@ def impl_test_rdf_connection() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sync_graph_to_rdf() -> str:
     try:
         stats = sync_neo4j_to_rdf(get_neo4j(), get_fuseki())
@@ -945,6 +1040,7 @@ def impl_sync_graph_to_rdf() -> str:
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
+@debug_tool
 def impl_run_sparql(query: str) -> str:
     try:
         results = get_fuseki().sparql_query(query)
@@ -958,6 +1054,7 @@ def impl_run_sparql(query: str) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_list_tables() -> str:
     try:
         results = get_sparql().list_tables()
@@ -971,6 +1068,7 @@ def impl_sparql_list_tables() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_get_foreign_keys(table_name: str = None) -> str:
     try:
         results = get_sparql().get_foreign_keys(table_name)
@@ -984,6 +1082,7 @@ def impl_sparql_get_foreign_keys(table_name: str = None) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_table_lineage(table_name: str) -> str:
     try:
         results = get_sparql().get_table_lineage(table_name)
@@ -997,6 +1096,7 @@ def impl_sparql_table_lineage(table_name: str) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_downstream_impact(table_name: str) -> str:
     try:
         results = get_sparql().get_downstream_impact(table_name)
@@ -1010,6 +1110,7 @@ def impl_sparql_downstream_impact(table_name: str) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_hub_tables(min_connections: int = 3) -> str:
     try:
         results = get_sparql().get_hub_tables(min_connections)
@@ -1023,6 +1124,7 @@ def impl_sparql_hub_tables(min_connections: int = 3) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_orphan_tables() -> str:
     try:
         results = get_sparql().find_orphan_tables()
@@ -1036,6 +1138,7 @@ def impl_sparql_orphan_tables() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_sparql_search(search_term: str) -> str:
     try:
         results = get_sparql().search_by_label(search_term)
@@ -1049,6 +1152,7 @@ def impl_sparql_search(search_term: str) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_get_rdf_statistics() -> str:
     try:
         stats = get_sparql().get_statistics()
@@ -1060,6 +1164,7 @@ def impl_get_rdf_statistics() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_export_rdf_turtle() -> str:
     try:
         turtle = get_fuseki().export_turtle()
@@ -1068,6 +1173,7 @@ def impl_export_rdf_turtle() -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_learn_rules_with_ltn(epochs: int = 100) -> str:
     if not LTN_AVAILABLE:
         return "LTN not available. Please install ltn package."
@@ -1075,125 +1181,104 @@ def impl_learn_rules_with_ltn(epochs: int = 100) -> str:
         learner = get_rule_learner()
         results = learner.learn_rules()
         output = "## LTN Rule Learning Results\n"
-        output += f"- Rules learned: {len(results)}\n"
-        for r in results:
-            output += f"  - {r.rule_type}: {r.formula} (confidence {r.confidence:.3f})\n"
+        output += f"- Rules learned: {len(results.get('rules', []))}\n"
         return output
     except Exception as e:
-        import traceback
-        return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        return f"ERROR: {type(e).__name__}: {e}"
 
+
+@debug_tool
 def impl_generate_business_rules_from_ltn() -> str:
     if not LTN_AVAILABLE:
         return "LTN not available."
     try:
         generator = get_rule_generator()
-        rules = generator.generate_from_ltn()
-        if "generated_rules" not in st.session_state:
-            st.session_state.generated_rules = []
-        st.session_state.generated_rules = rules
-        
-        output = f"## Generated {len(rules)} Business Rules from LTN\n"
-        for r in rules:
+        rules = generator.generate_from_learned_rules(get_rule_learner().learned_rules)
+        output = f"## Generated {len(rules)} business rules from LTN\n"
+        for r in rules[:10]:
             output += f"- {r.name}: {r.description}\n"
         return output
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_generate_all_validation_rules() -> str:
     if not LTN_AVAILABLE:
         return "LTN not available."
     try:
         generator = get_rule_generator()
-        rules = generator.generate_all_validation_rules(get_neo4j())
-        if "generated_rules" not in st.session_state:
-            st.session_state.generated_rules = []
-        st.session_state.generated_rules.extend(rules)
-        
-        output = f"## Generated {len(rules)} Validation Rules\n"
-        for r in rules:
-            output += f"- {r.name}\n"
+        rules = generator.generate_all_from_graph()
+        st.session_state.generated_rules = rules
+        output = f"## Generated {len(rules)} validation rules\n"
+        for r in rules[:10]:
+            output += f"- {r.name}: {r.description}\n"
+        if len(rules) > 10:
+            output += f"... and {len(rules) - 10} more\n"
         return output
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_export_generated_rules_yaml(file_path: str = "business_rules_generated.yaml") -> str:
-    if "generated_rules" not in st.session_state or not st.session_state.generated_rules:
-        return "No generated rules to export."
+    if "generated_rules" not in st.session_state:
+        return "No generated rules. Run generate_all_validation_rules first."
     try:
-        import yaml
-        rules_data = {
-            "version": "1.0",
-            "namespace": "generated",
-            "rules": [
-                {
-                    "name": r.name,
-                    "description": r.description,
-                    "type": r.rule_type,
-                    "sql": r.sql,
-                    "inputs": r.inputs,
-                    "outputs": r.outputs,
-                    "tags": r.tags,
-                }
-                for r in st.session_state.generated_rules
-            ]
-        }
+        generator = get_rule_generator()
+        yaml_content = generator.export_yaml(st.session_state.generated_rules)
         with open(file_path, 'w') as f:
-            yaml.dump(rules_data, f, default_flow_style=False)
+            f.write(yaml_content)
         return f"✓ Exported {len(st.session_state.generated_rules)} rules to {file_path}"
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_export_generated_rules_sql() -> str:
-    if "generated_rules" not in st.session_state or not st.session_state.generated_rules:
-        return "No generated rules to export."
-    output = "## Generated Rules SQL\n\n"
-    for r in st.session_state.generated_rules:
-        output += f"-- {r.name}: {r.description}\n"
-        output += f"{r.sql}\n\n"
-    return output
+    if "generated_rules" not in st.session_state:
+        return "No generated rules."
+    try:
+        generator = get_rule_generator()
+        sql = generator.export_sql(st.session_state.generated_rules)
+        return f"## Generated SQL\n```sql\n{sql[:3000]}{'...' if len(sql) > 3000 else ''}\n```"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
+
+@debug_tool
 def impl_show_ltn_knowledge_base() -> str:
     if not LTN_AVAILABLE:
         return "LTN not available."
     try:
         kb = LTNKnowledgeBase.create_default()
-        data = kb.to_dict()
-        output = "## LTN Knowledge Base\n"
-        output += f"- Axioms: {len(data.get('axioms', []))}\n"
-        output += f"- Constraints: {len(data.get('constraints', []))}\n"
-        output += f"- Predicates: {data.get('predicates', [])}\n"
+        output = "## LTN Knowledge Base\n\n### Axioms:\n"
+        for axiom in kb.get_all_axioms():
+            output += f"- **{axiom.name}**: {axiom.formula}\n"
         return output
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
+
+@debug_tool
 def impl_check_tool_exists(tool_name: str) -> str:
-    return "✓ EXISTS" if get_registry().tool_exists(tool_name) else "✗ NOT FOUND"
+    r = get_registry()
+    if r.tool_exists(tool_name):
+        return f"✓ Tool '{tool_name}' exists"
+    return f"✗ Tool '{tool_name}' not found"
 
 
+@debug_tool
 def impl_list_available_tools() -> str:
-    dynamic = get_registry().list_tools()
-    output = "## Available Tools\n\n"
-    output += "### Builtin Tools:\n"
-    output += "- **Database**: configure_database, test_database_connection, list_database_tables, get_table_schema, get_column_stats\n"
-    output += "- **FK Discovery**: run_fk_discovery, analyze_potential_fk, validate_fk_with_data\n"
-    output += "- **Graph**: clear_neo4j_graph, add_fk_to_graph, get_graph_stats, analyze_graph_centrality, find_table_communities, predict_missing_fks, run_cypher\n"
-    output += "- **Embeddings**: generate_text_embeddings, generate_kg_embeddings, create_vector_indexes, semantic_search_tables, semantic_search_columns\n"
-    output += "- **Business Rules**: load_business_rules, execute_business_rule, execute_all_business_rules\n"
-    output += "- **RDF/SPARQL**: test_rdf_connection, sync_graph_to_rdf, run_sparql\n"
-    output += "- **LTN**: learn_rules_with_ltn, generate_business_rules_from_ltn\n"
-    output += "\n### Dynamic Tools:\n"
-    if dynamic:
-        for t in dynamic:
-            output += f"- **{t['name']}**: {t.get('description', 'No description')}\n"
-    else:
-        output += "- None created yet\n"
+    r = get_registry()
+    tools = r.list_tools()
+    output = "## Available Dynamic Tools\n"
+    for t in tools:
+        output += f"- **{t['name']}**: {t['description']}\n"
     return output
 
 
+@debug_tool
 def impl_create_dynamic_tool(name: str, description: str, code: str) -> str:
     r = get_registry()
     if r.tool_exists(name):
@@ -1208,6 +1293,7 @@ def impl_create_dynamic_tool(name: str, description: str, code: str) -> str:
         return f"ERROR: Syntax error: {e}"
 
 
+@debug_tool
 def impl_run_dynamic_tool(tool_name: str, **kwargs) -> str:
     r = get_registry()
     if not r.tool_exists(tool_name):
@@ -1218,6 +1304,7 @@ def impl_run_dynamic_tool(tool_name: str, **kwargs) -> str:
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_get_tool_source(tool_name: str) -> str:
     r = get_registry()
     if not r.tool_exists(tool_name):
@@ -1225,6 +1312,7 @@ def impl_get_tool_source(tool_name: str) -> str:
     return r.get_tool_source(tool_name)
 
 
+@debug_tool
 def impl_update_dynamic_tool(tool_name: str, code: str, description: str = None) -> str:
     r = get_registry()
     if not r.tool_exists(tool_name):
@@ -1236,6 +1324,7 @@ def impl_update_dynamic_tool(tool_name: str, code: str, description: str = None)
         return f"ERROR: {type(e).__name__}: {e}"
 
 
+@debug_tool
 def impl_delete_dynamic_tool(tool_name: str) -> str:
     r = get_registry()
     if not r.tool_exists(tool_name):
@@ -1249,7 +1338,6 @@ def impl_delete_dynamic_tool(tool_name: str) -> str:
 # =============================================================================
 
 STREAMING_TOOL_FUNCTIONS = {
-    # Dynamic tools
     "check_tool_exists": lambda **kw: impl_check_tool_exists(**kw),
     "list_available_tools": lambda **kw: impl_list_available_tools(),
     "create_dynamic_tool": lambda **kw: impl_create_dynamic_tool(**kw),
@@ -1257,17 +1345,14 @@ STREAMING_TOOL_FUNCTIONS = {
     "get_tool_source": lambda **kw: impl_get_tool_source(**kw),
     "update_dynamic_tool": lambda **kw: impl_update_dynamic_tool(**kw),
     "delete_dynamic_tool": lambda **kw: impl_delete_dynamic_tool(**kw),
-    # Database
     "configure_database": lambda **kw: impl_configure_database(**kw),
     "test_database_connection": lambda **kw: impl_test_database_connection(),
     "list_database_tables": lambda **kw: impl_list_database_tables(),
     "get_table_schema": lambda **kw: impl_get_table_schema(**kw),
     "get_column_stats": lambda **kw: impl_get_column_stats(**kw),
-    # FK Discovery
     "run_fk_discovery": lambda **kw: impl_run_fk_discovery(**kw),
     "analyze_potential_fk": lambda **kw: impl_analyze_potential_fk(**kw),
     "validate_fk_with_data": lambda **kw: impl_validate_fk_with_data(**kw),
-    # Graph
     "clear_neo4j_graph": lambda **kw: impl_clear_neo4j_graph(),
     "add_fk_to_graph": lambda **kw: impl_add_fk_to_graph(**kw),
     "get_graph_stats": lambda **kw: impl_get_graph_stats(),
@@ -1276,7 +1361,6 @@ STREAMING_TOOL_FUNCTIONS = {
     "predict_missing_fks": lambda **kw: impl_predict_missing_fks(),
     "run_cypher": lambda **kw: impl_run_cypher(**kw),
     "connect_datasets_to_tables": lambda **kw: impl_connect_datasets_to_tables(),
-    # Embeddings
     "generate_text_embeddings": lambda **kw: impl_generate_text_embeddings(),
     "generate_kg_embeddings": lambda **kw: impl_generate_kg_embeddings(),
     "create_vector_indexes": lambda **kw: impl_create_vector_indexes(),
@@ -1286,7 +1370,6 @@ STREAMING_TOOL_FUNCTIONS = {
     "find_similar_columns": lambda **kw: impl_find_similar_columns(**kw),
     "predict_fks_from_embeddings": lambda **kw: impl_predict_fks_from_embeddings(**kw),
     "semantic_fk_discovery": lambda **kw: impl_semantic_fk_discovery(**kw),
-    # Business Rules
     "show_sample_business_rules": lambda **kw: impl_show_sample_business_rules(),
     "load_business_rules": lambda **kw: impl_load_business_rules(**kw),
     "load_business_rules_from_file": lambda **kw: impl_load_business_rules_from_file(**kw),
@@ -1298,7 +1381,6 @@ STREAMING_TOOL_FUNCTIONS = {
     "import_lineage_to_graph": lambda **kw: impl_import_lineage_to_graph(),
     "analyze_data_flow": lambda **kw: impl_analyze_data_flow(**kw),
     "find_impact_analysis": lambda **kw: impl_find_impact_analysis(**kw),
-    # RDF
     "test_rdf_connection": lambda **kw: impl_test_rdf_connection(),
     "sync_graph_to_rdf": lambda **kw: impl_sync_graph_to_rdf(),
     "run_sparql": lambda **kw: impl_run_sparql(**kw),
@@ -1311,7 +1393,6 @@ STREAMING_TOOL_FUNCTIONS = {
     "sparql_search": lambda **kw: impl_sparql_search(**kw),
     "get_rdf_statistics": lambda **kw: impl_get_rdf_statistics(),
     "export_rdf_turtle": lambda **kw: impl_export_rdf_turtle(),
-    # LTN
     "learn_rules_with_ltn": lambda **kw: impl_learn_rules_with_ltn(**kw),
     "generate_business_rules_from_ltn": lambda **kw: impl_generate_business_rules_from_ltn(),
     "generate_all_validation_rules": lambda **kw: impl_generate_all_validation_rules(),
@@ -1322,72 +1403,109 @@ STREAMING_TOOL_FUNCTIONS = {
 
 
 # =============================================================================
-# Streaming Chat Implementation
+# Streaming Chat with Full Debug Logging
 # =============================================================================
 
 def stream_agent_response(client: anthropic.Anthropic, messages: List[Dict], message_placeholder) -> str:
-    """Stream response from Claude with tool execution."""
+    """Stream response from Claude with FULL terminal debugging."""
+    
+    api_logger = APIStreamLogger()
     full_response = ""
     tool_results_log = []
     
     while True:
         tool_inputs = {}
         current_block_id = None
+        current_block_type = None
         current_response_content = []
         
-        with client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=8192,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-            tools=STREAMING_TOOLS,
-        ) as stream:
-            for event in stream:
-                if event.type == "content_block_start":
-                    if event.content_block.type == "tool_use":
-                        current_block_id = event.content_block.id
-                        tool_inputs[current_block_id] = {
-                            "name": event.content_block.name,
-                            "input": ""
-                        }
-                        full_response += f"\n\n🔧 **Calling: {event.content_block.name}**\n"
-                        message_placeholder.markdown(full_response + "▌")
+        api_logger.on_stream_start("claude-sonnet-4-20250514", messages)
+        
+        try:
+            with client.messages.stream(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=STREAMING_TOOLS,
+            ) as stream:
+                for event in stream:
+                    if event.type == "content_block_start":
+                        current_block_type = event.content_block.type
+                        api_logger.on_content_block_start(
+                            event.content_block.type,
+                            getattr(event.content_block, 'id', None),
+                            getattr(event.content_block, 'name', None)
+                        )
                         
-                elif event.type == "content_block_delta":
-                    if event.delta.type == "text_delta":
-                        full_response += event.delta.text
-                        message_placeholder.markdown(full_response + "▌")
-                    elif event.delta.type == "input_json_delta":
-                        if current_block_id:
-                            tool_inputs[current_block_id]["input"] += event.delta.partial_json
+                        if event.content_block.type == "tool_use":
+                            current_block_id = event.content_block.id
+                            tool_inputs[current_block_id] = {
+                                "name": event.content_block.name,
+                                "input": ""
+                            }
+                            full_response += f"\n\n🔧 **Calling: {event.content_block.name}**\n"
+                            message_placeholder.markdown(full_response + "▌")
                             
-                elif event.type == "content_block_stop":
-                    current_block_id = None
-            
-            response = stream.get_final_message()
-            current_response_content = response.content
+                    elif event.type == "content_block_delta":
+                        if event.delta.type == "text_delta":
+                            api_logger.on_text_delta(event.delta.text)
+                            full_response += event.delta.text
+                            message_placeholder.markdown(full_response + "▌")
+                        elif event.delta.type == "input_json_delta":
+                            api_logger.on_input_json_delta(event.delta.partial_json)
+                            if current_block_id:
+                                tool_inputs[current_block_id]["input"] += event.delta.partial_json
+                                
+                    elif event.type == "content_block_stop":
+                        api_logger.on_content_block_stop(current_block_type)
+                        current_block_id = None
+                        current_block_type = None
+                
+                response = stream.get_final_message()
+                current_response_content = response.content
+                api_logger.on_stream_end(response.stop_reason)
+                
+        except Exception as e:
+            api_logger.on_error(e)
+            debug.error(f"API streaming error: {e}", e)
+            raise
         
         messages.append({"role": "assistant", "content": current_response_content})
         
         if response.stop_reason != "tool_use":
+            debug.agent(f"Agent finished with stop_reason: {response.stop_reason}")
             break
         
         tool_results = []
         for block in current_response_content:
             if block.type == "tool_use":
+                debug.section(f"EXECUTING TOOL: {block.name}")
+                debug.tool(f"Tool inputs:", block.input)
+                
                 full_response += f"\n⏳ Executing...\n"
                 message_placeholder.markdown(full_response + "▌")
                 
                 fn = STREAMING_TOOL_FUNCTIONS.get(block.name)
                 if fn:
                     try:
+                        start_time = time.time()
                         result = fn(**block.input)
+                        duration = time.time() - start_time
+                        
+                        debug.tool(f"✓ Tool completed in {duration*1000:.1f}ms")
+                        api_logger.on_tool_result(block.name, result)
+                        
                     except Exception as e:
+                        debug.error(f"Tool execution failed: {e}", e)
+                        import traceback
+                        traceback.print_exc()
                         result = f"Error: {type(e).__name__}: {e}"
                 else:
+                    debug.error(f"Unknown tool: {block.name}")
                     result = f"Unknown tool: {block.name}"
                 
-                full_response += f"\n```\n{result}\n```\n"
+                full_response += f"\n{result}\n"
                 message_placeholder.markdown(full_response + "▌")
                 tool_results_log.append({"tool": block.name, "result": result})
                 
@@ -1398,13 +1516,13 @@ def stream_agent_response(client: anthropic.Anthropic, messages: List[Dict], mes
                 })
         
         messages.append({"role": "user", "content": tool_results})
+        debug.agent("Sending tool results back to agent, continuing loop...")
     
     message_placeholder.markdown(full_response)
     return full_response
 
 
 def get_anthropic_client():
-    """Get or create Anthropic client."""
     api_key = st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -1428,39 +1546,26 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configuration")
         
+        if DEBUG_MODE:
+            st.success("🔍 DEBUG MODE: ON")
+            st.caption("Check terminal for logs")
+        
         api_key = st.text_input(
             "Anthropic API Key",
             type="password",
             value=st.session_state.get("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", "")),
-            help="Enter your Anthropic API key"
         )
         if api_key:
             st.session_state.anthropic_api_key = api_key
-        
-        st.session_state.use_streaming = st.toggle(
-            "🔴 Enable Streaming",
-            value=st.session_state.get("use_streaming", True),
-            help="Stream responses in real-time"
-        )
         
         st.divider()
         
         st.subheader("🗄️ PostgreSQL")
         pg_host = st.text_input("Host", value=st.session_state.get("pg_host", os.environ.get("POSTGRES_HOST", "localhost")))
-        pg_port = st.number_input("Port", value=int(st.session_state.get("pg_port", os.environ.get("POSTGRES_PORT", "5432"))), min_value=1, max_value=65535)
+        pg_port = st.number_input("Port", value=int(st.session_state.get("pg_port", os.environ.get("POSTGRES_PORT", "5432"))))
         pg_database = st.text_input("Database", value=st.session_state.get("pg_database", os.environ.get("POSTGRES_DB", "orders")))
         pg_username = st.text_input("Username", value=st.session_state.get("pg_username", os.environ.get("POSTGRES_USER", "saphenia")))
         pg_password = st.text_input("Password", type="password", value=st.session_state.get("pg_password", os.environ.get("POSTGRES_PASSWORD", "secret")))
-        
-        if st.button("Update DB Config"):
-            st.session_state.pg_host = pg_host
-            st.session_state.pg_port = pg_port
-            st.session_state.pg_database = pg_database
-            st.session_state.pg_username = pg_username
-            st.session_state.pg_password = pg_password
-            if "pg_connector" in st.session_state:
-                del st.session_state.pg_connector
-            st.success("Database configuration updated!")
         
         st.divider()
         
@@ -1468,14 +1573,6 @@ def main():
         neo4j_uri = st.text_input("URI", value=st.session_state.get("neo4j_uri", os.environ.get("NEO4J_URI", "bolt://localhost:7687")))
         neo4j_user = st.text_input("Neo4j User", value=st.session_state.get("neo4j_user", os.environ.get("NEO4J_USER", "neo4j")))
         neo4j_password = st.text_input("Neo4j Password", type="password", value=st.session_state.get("neo4j_password", os.environ.get("NEO4J_PASSWORD", "password")))
-        
-        if st.button("Update Neo4j Config"):
-            st.session_state.neo4j_uri = neo4j_uri
-            st.session_state.neo4j_user = neo4j_user
-            st.session_state.neo4j_password = neo4j_password
-            if "neo4j_client" in st.session_state:
-                del st.session_state.neo4j_client
-            st.success("Neo4j configuration updated!")
         
         st.divider()
         
@@ -1517,66 +1614,37 @@ def main():
         prompt = st.chat_input("Ask me about your database...")
     
     if prompt:
+        debug.section("NEW USER MESSAGE")
+        debug.agent(f"User: {prompt}")
+        
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
             try:
-                if st.session_state.get("use_streaming", True):
-                    client = get_anthropic_client()
-                    if client is None:
-                        st.error("Failed to create Anthropic client. Please check your API key.")
-                        st.stop()
+                client = get_anthropic_client()
+                if client is None:
+                    st.error("Failed to create Anthropic client. Please check your API key.")
+                    st.stop()
+                
+                st.session_state.streaming_messages.append({"role": "user", "content": prompt})
+                message_placeholder = st.empty()
+                
+                response = stream_agent_response(
+                    client, 
+                    st.session_state.streaming_messages.copy(),
+                    message_placeholder
+                )
+                
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.session_state.streaming_messages.append({"role": "assistant", "content": response})
+                
+                if len(st.session_state.streaming_messages) > 20:
+                    st.session_state.streaming_messages = st.session_state.streaming_messages[-20:]
                     
-                    st.session_state.streaming_messages.append({"role": "user", "content": prompt})
-                    message_placeholder = st.empty()
-                    
-                    response = stream_agent_response(
-                        client, 
-                        st.session_state.streaming_messages.copy(),
-                        message_placeholder
-                    )
-                    
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                    st.session_state.streaming_messages.append({"role": "assistant", "content": response})
-                    
-                    if len(st.session_state.streaming_messages) > 20:
-                        st.session_state.streaming_messages = st.session_state.streaming_messages[-20:]
-                else:
-                    with st.spinner("Thinking..."):
-                        from langgraph.prebuilt import create_react_agent
-                        
-                        llm = ChatAnthropic(
-                            model="claude-sonnet-4-20250514",
-                            api_key=st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY"),
-                            max_tokens=8192,
-                        )
-                        
-                        tools = [
-                            test_database_connection_tool,
-                            list_database_tables_tool,
-                            run_fk_discovery_tool,
-                            get_graph_stats_tool,
-                        ]
-                        
-                        agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
-                        result = agent.invoke(
-                            {"messages": [HumanMessage(content=prompt)]},
-                            config={"recursion_limit": 100}
-                        )
-                        
-                        messages = result.get("messages", [])
-                        if messages:
-                            last_msg = messages[-1]
-                            response = getattr(last_msg, 'content', str(last_msg))
-                        else:
-                            response = str(result)
-                        
-                        st.markdown(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                        
             except Exception as e:
+                debug.error(f"Fatal error: {e}", e)
                 import traceback
                 error_msg = f"Error: {type(e).__name__}: {e}\n\n```\n{traceback.format_exc()}\n```"
                 st.error(error_msg)
