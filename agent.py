@@ -3068,7 +3068,8 @@ def create_agent(verbose: bool = True):
         max_tokens=4096,
     )
     
-    agent = create_react_agent(llm, ALL_TOOLS, state_modifier=SYSTEM_PROMPT)
+    # Use 'prompt' parameter (correct for LangGraph v1.0+)
+    agent = create_react_agent(llm, ALL_TOOLS, prompt=SYSTEM_PROMPT)
     
     return agent
 

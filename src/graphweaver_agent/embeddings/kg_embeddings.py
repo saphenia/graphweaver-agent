@@ -1,505 +1,330 @@
-"""
-Knowledge Graph Embeddings - Generate structural embeddings using Neo4j GDS.
+"""Knowledge Graph Embeddings using Neo4j GDS FastRP.
 
-Uses FastRP (Fast Random Projection) algorithm which is fast and effective
-for link prediction and node similarity tasks.
-
-FIXED: Better GDS availability checking, graceful fallback, and error handling.
+FIXED: Uses run_write() for GDS mutate operations which require write transactions.
+The error "Writing in read access mode not allowed" was caused by using run_query()
+for GDS operations that mutate the graph.
 """
-from typing import Dict, List, Any, Optional
-import traceback
+from typing import Any, Dict, List, Optional
 
 
 class KGEmbedder:
-    """Generate knowledge graph embeddings using Neo4j GDS FastRP."""
+    """Generate knowledge graph embeddings using Neo4j GDS FastRP algorithm.
     
-    def __init__(self, neo4j_client, embedding_dimension: int = 128):
-        """
-        Initialize KG embedder.
-        
-        Args:
-            neo4j_client: Neo4j client instance
-            embedding_dimension: Dimension of output embeddings (default 128)
-        """
-        self.neo4j = neo4j_client
-        self.embedding_dimension = embedding_dimension
-        self.graph_name = "graphweaver_kg"
-        self._gds_available = None
-        self._gds_version = None
-        
+    FIXED: All GDS operations that mutate the graph now use run_write()
+    instead of run_query() to ensure proper write transaction mode.
+    """
+    
+    GRAPH_NAME = "graphweaver_kg"
+    EMBEDDING_DIM = 128
+    
+    def __init__(self, neo4j_client):
+        self.client = neo4j_client
+    
     def check_gds_available(self) -> bool:
-        """Check if Neo4j GDS is available."""
-        if self._gds_available is not None:
-            return self._gds_available
-            
+        """Check if Neo4j GDS plugin is available."""
         try:
-            result = self.neo4j.run_query("RETURN gds.version() as version")
-            if result:
-                self._gds_version = result[0]['version']
-                self._gds_available = True
-                print(f"[KGEmbedder] Neo4j GDS version: {self._gds_version}")
-                return True
-        except Exception as e:
-            print(f"[KGEmbedder] GDS not available: {e}")
-            self._gds_available = False
-        return False
+            result = self.client.run_query("RETURN gds.version() as version")
+            return bool(result)
+        except:
+            return False
     
-    def get_gds_status(self) -> Dict[str, Any]:
-        """Get detailed GDS status information."""
-        status = {
-            "available": self.check_gds_available(),
-            "version": self._gds_version,
+    def drop_projection_if_exists(self):
+        """Drop existing graph projection if it exists."""
+        try:
+            # Check if projection exists
+            result = self.client.run_query(
+                "CALL gds.graph.exists($name) YIELD exists RETURN exists",
+                {"name": self.GRAPH_NAME}
+            )
+            if result and result[0].get("exists"):
+                # FIXED: Use run_write for drop operation
+                self.client.run_write(
+                    "CALL gds.graph.drop($name) YIELD graphName RETURN graphName",
+                    {"name": self.GRAPH_NAME}
+                )
+                print(f"[KGEmbedder] Dropped existing projection: {self.GRAPH_NAME}")
+        except Exception as e:
+            print(f"[KGEmbedder] Note: {e}")
+    
+    def create_projection(self) -> Dict[str, Any]:
+        """Create a graph projection for embedding generation.
+        
+        FIXED: Uses run_write() because gds.graph.project mutates the catalog.
+        """
+        self.drop_projection_if_exists()
+        
+        # Project all nodes and relationships
+        query = """
+        CALL gds.graph.project(
+            $name,
+            ['Table', 'Column', 'Job', 'Dataset', 'DataSource'],
+            {
+                BELONGS_TO: {orientation: 'UNDIRECTED'},
+                FK_TO: {orientation: 'UNDIRECTED'},
+                READS: {orientation: 'UNDIRECTED'},
+                WRITES: {orientation: 'UNDIRECTED'},
+                REPRESENTS: {orientation: 'UNDIRECTED'}
+            }
+        )
+        YIELD graphName, nodeCount, relationshipCount
+        RETURN graphName, nodeCount, relationshipCount
+        """
+        
+        try:
+            # FIXED: Use run_write for projection creation
+            result = self.client.run_write(query, {"name": self.GRAPH_NAME})
+            if result:
+                stats = result[0]
+                print(f"[KGEmbedder] Graph projected: {stats.get('nodeCount')} nodes, {stats.get('relationshipCount')} relationships")
+                return {
+                    "graphName": stats.get("graphName"),
+                    "nodeCount": stats.get("nodeCount"),
+                    "relationshipCount": stats.get("relationshipCount")
+                }
+        except Exception as e:
+            print(f"[KGEmbedder] Projection failed: {e}")
+            raise
+        
+        return {}
+    
+    def generate_fastrp_embeddings(self) -> Dict[str, Any]:
+        """Generate FastRP embeddings and store them on nodes.
+        
+        FIXED: Uses run_write() because gds.fastRP.mutate writes to the graph.
+        """
+        query = """
+        CALL gds.fastRP.mutate(
+            $name,
+            {
+                embeddingDimension: $dim,
+                mutateProperty: 'kg_embedding',
+                randomSeed: 42,
+                iterationWeights: [0.0, 1.0, 1.0]
+            }
+        )
+        YIELD nodePropertiesWritten, computeMillis
+        RETURN nodePropertiesWritten, computeMillis
+        """
+        
+        print(f"[KGEmbedder] Generating FastRP embeddings (dim={self.EMBEDDING_DIM})...")
+        
+        try:
+            # FIXED: Use run_write for FastRP mutate operation
+            result = self.client.run_write(query, {
+                "name": self.GRAPH_NAME,
+                "dim": self.EMBEDDING_DIM
+            })
+            
+            if result:
+                stats = result[0]
+                print(f"[KGEmbedder] FastRP complete: {stats.get('nodePropertiesWritten')} nodes embedded in {stats.get('computeMillis')}ms")
+                return {
+                    "nodes_embedded": stats.get("nodePropertiesWritten"),
+                    "compute_ms": stats.get("computeMillis")
+                }
+        except Exception as e:
+            print(f"[KGEmbedder] Failed to generate FastRP embeddings: {e}")
+            raise RuntimeError(f"Failed to generate FastRP embeddings: {e}")
+        
+        return {}
+    
+    def write_embeddings_to_nodes(self) -> int:
+        """Write embeddings from projection back to actual nodes.
+        
+        FIXED: Uses run_write() because this writes properties to nodes.
+        """
+        query = """
+        CALL gds.graph.nodeProperty.stream($name, 'kg_embedding')
+        YIELD nodeId, propertyValue
+        WITH gds.util.asNode(nodeId) AS node, propertyValue AS embedding
+        SET node.kg_embedding = embedding
+        RETURN count(*) as written
+        """
+        
+        try:
+            # FIXED: Use run_write for writing embeddings to nodes
+            result = self.client.run_write(query, {"name": self.GRAPH_NAME})
+            if result:
+                count = result[0].get("written", 0)
+                print(f"[KGEmbedder] Wrote embeddings to {count} nodes")
+                return count
+        except Exception as e:
+            print(f"[KGEmbedder] Failed to write embeddings: {e}")
+        
+        return 0
+    
+    def cleanup(self):
+        """Drop the graph projection to free memory."""
+        try:
+            self.client.run_write(
+                "CALL gds.graph.drop($name) YIELD graphName RETURN graphName",
+                {"name": self.GRAPH_NAME}
+            )
+            print(f"[KGEmbedder] Graph projection dropped")
+        except Exception as e:
+            print(f"[KGEmbedder] Cleanup note: {e}")
+    
+    def generate_embeddings(self) -> Dict[str, Any]:
+        """Full pipeline: project graph, generate embeddings, write to nodes.
+        
+        Returns stats about the embedding generation process.
+        """
+        stats = {
+            "projection": {},
+            "fastrp": {},
+            "nodes_written": 0,
+            "success": False
         }
         
-        if not status["available"]:
-            status["error"] = "Neo4j GDS plugin not installed or not accessible"
-            status["fix"] = (
-                "Install Neo4j GDS plugin or use neo4j:5-enterprise Docker image. "
-                "See: https://neo4j.com/docs/graph-data-science/current/installation/"
-            )
-        
-        return status
-    
-    def create_graph_projection(self) -> Dict[str, Any]:
-        """
-        Create an in-memory graph projection for embedding generation.
-        
-        Projects all node types and relationship types into memory.
-        """
-        if not self.check_gds_available():
-            return {"error": "GDS not available"}
-        
-        # Drop existing projection if exists
         try:
-            self.neo4j.run_write(f"CALL gds.graph.drop('{self.graph_name}', false)")
-            print(f"[KGEmbedder] Dropped existing graph projection")
-        except Exception:
-            pass  # Graph didn't exist
-        
-        # First, check what node labels exist
-        try:
-            existing_labels = self.neo4j.run_query("""
-                CALL db.labels() YIELD label
-                WHERE label IN ['Table', 'Column', 'Job', 'Dataset']
-                RETURN collect(label) as labels
-            """)
-            available_labels = existing_labels[0]['labels'] if existing_labels else []
-            print(f"[KGEmbedder] Available labels: {available_labels}")
+            # Step 1: Create projection
+            stats["projection"] = self.create_projection()
             
-            if not available_labels:
-                return {"error": "No Table, Column, Job, or Dataset nodes found in graph"}
+            # Step 2: Generate FastRP embeddings
+            stats["fastrp"] = self.generate_fastrp_embeddings()
+            
+            # Step 3: Write embeddings to actual nodes
+            stats["nodes_written"] = self.write_embeddings_to_nodes()
+            
+            stats["success"] = True
+            
         except Exception as e:
-            print(f"[KGEmbedder] Error checking labels: {e}")
-            available_labels = ['Table', 'Column', 'Job', 'Dataset']
+            stats["error"] = str(e)
+            print(f"[KGEmbedder] Embedding generation failed: {e}")
         
-        # Check what relationship types exist
-        try:
-            existing_rels = self.neo4j.run_query("""
-                CALL db.relationshipTypes() YIELD relationshipType
-                WHERE relationshipType IN ['BELONGS_TO', 'FK_TO', 'READS', 'WRITES', 'REPRESENTS']
-                RETURN collect(relationshipType) as types
-            """)
-            available_rels = existing_rels[0]['types'] if existing_rels else []
-            print(f"[KGEmbedder] Available relationship types: {available_rels}")
-            
-            if not available_rels:
-                return {"error": "No relationships found in graph. Run FK discovery first."}
-        except Exception as e:
-            print(f"[KGEmbedder] Error checking relationships: {e}")
-            available_rels = ['BELONGS_TO', 'FK_TO']
+        finally:
+            # Always cleanup projection
+            self.cleanup()
         
-        # Build relationship config dynamically
-        rel_config = {}
-        for rel in available_rels:
-            rel_config[rel] = {"orientation": "UNDIRECTED"}
-        
-        # Create new projection with available labels and relationships
-        try:
-            result = self.neo4j.run_query(f"""
-                CALL gds.graph.project(
-                    '{self.graph_name}',
-                    {available_labels},
-                    $rel_config
-                )
-                YIELD graphName, nodeCount, relationshipCount
-                RETURN graphName, nodeCount, relationshipCount
-            """, {"rel_config": rel_config})
-            
-            if result:
-                stats = result[0]
-                print(f"[KGEmbedder] Graph projected: {stats['nodeCount']} nodes, {stats['relationshipCount']} relationships")
-                return {
-                    "graphName": stats["graphName"],
-                    "nodeCount": stats["nodeCount"],
-                    "relationshipCount": stats["relationshipCount"],
-                }
-        except Exception as e:
-            error_msg = f"Failed to create graph projection: {e}"
-            print(f"[KGEmbedder] {error_msg}")
-            traceback.print_exc()
-            return {"error": error_msg}
-        
-        return {"error": "Unknown error creating graph projection"}
-    
-    def generate_fastrp_embeddings(
-        self,
-        iterations: int = 4,
-        normalization_strength: float = 0.0,
-        property_name: str = "kg_embedding",
-    ) -> Dict[str, Any]:
-        """
-        Generate FastRP embeddings and write to nodes.
-        
-        FastRP is a fast algorithm that uses random projection to create
-        embeddings that capture graph structure (neighborhood similarity).
-        
-        Args:
-            iterations: Number of iterations (more = captures longer paths)
-            normalization_strength: L2 normalization (-1 to 1)
-            property_name: Name of the property to store embeddings
-            
-        Returns:
-            Statistics dict
-        """
-        if not self.check_gds_available():
-            return {"error": "GDS not available"}
-        
-        print(f"[KGEmbedder] Generating FastRP embeddings (dim={self.embedding_dimension})...")
-        
-        try:
-            # Run FastRP and write back to graph
-            result = self.neo4j.run_query(f"""
-                CALL gds.fastRP.write(
-                    '{self.graph_name}',
-                    {{
-                        embeddingDimension: {self.embedding_dimension},
-                        iterationWeights: [0.0, 1.0, 1.0, 1.0],
-                        normalizationStrength: {normalization_strength},
-                        writeProperty: '{property_name}'
-                    }}
-                )
-                YIELD nodeCount, nodePropertiesWritten
-                RETURN nodeCount, nodePropertiesWritten
-            """)
-            
-            if result:
-                stats = result[0]
-                print(f"[KGEmbedder] Embeddings written: {stats['nodePropertiesWritten']} properties on {stats['nodeCount']} nodes")
-                return {
-                    "nodes": stats["nodeCount"],
-                    "properties_written": stats["nodePropertiesWritten"],
-                }
-        except Exception as e:
-            error_msg = f"Failed to generate FastRP embeddings: {e}"
-            print(f"[KGEmbedder] {error_msg}")
-            traceback.print_exc()
-            return {"error": error_msg}
-        
-        return {"error": "Unknown error generating embeddings"}
-    
-    def generate_node2vec_embeddings(
-        self,
-        walk_length: int = 80,
-        walks_per_node: int = 10,
-        property_name: str = "kg_embedding_n2v",
-    ) -> Dict[str, int]:
-        """
-        Generate Node2Vec embeddings (alternative to FastRP).
-        
-        Node2Vec uses biased random walks to learn embeddings.
-        Better for some tasks but slower than FastRP.
-        
-        Args:
-            walk_length: Length of random walks
-            walks_per_node: Number of walks per node
-            property_name: Name of the property to store embeddings
-            
-        Returns:
-            Statistics dict
-        """
-        if not self.check_gds_available():
-            return {"error": "GDS not available"}
-        
-        print(f"[KGEmbedder] Generating Node2Vec embeddings (dim={self.embedding_dimension})...")
-        
-        try:
-            result = self.neo4j.run_query(f"""
-                CALL gds.node2vec.write(
-                    '{self.graph_name}',
-                    {{
-                        embeddingDimension: {self.embedding_dimension},
-                        walkLength: {walk_length},
-                        walksPerNode: {walks_per_node},
-                        writeProperty: '{property_name}'
-                    }}
-                )
-                YIELD nodeCount, nodePropertiesWritten
-                RETURN nodeCount, nodePropertiesWritten
-            """)
-            
-            if result:
-                stats = result[0]
-                print(f"[KGEmbedder] Node2Vec embeddings written: {stats['nodePropertiesWritten']} properties")
-                return {
-                    "nodes": stats["nodeCount"],
-                    "properties_written": stats["nodePropertiesWritten"],
-                }
-        except Exception as e:
-            error_msg = f"Failed to generate Node2Vec embeddings: {e}"
-            print(f"[KGEmbedder] {error_msg}")
-            return {"error": error_msg}
-        
-        return {"error": "Unknown error generating Node2Vec embeddings"}
-    
-    def find_similar_nodes(
-        self,
-        node_label: str,
-        node_name: str,
-        property_name: str = "kg_embedding",
-        top_k: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """
-        Find nodes most similar to a given node using KG embeddings.
-        
-        Args:
-            node_label: Label of the source node (Table, Column, etc.)
-            node_name: Name of the source node
-            property_name: Embedding property to use
-            top_k: Number of results to return
-            
-        Returns:
-            List of similar nodes with similarity scores
-        """
-        if not self.check_gds_available():
-            return []
-        
-        try:
-            result = self.neo4j.run_query(f"""
-                MATCH (source:{node_label} {{name: $name}})
-                MATCH (other:{node_label})
-                WHERE other <> source AND other.{property_name} IS NOT NULL
-                WITH source, other, 
-                     gds.similarity.cosine(source.{property_name}, other.{property_name}) AS similarity
-                RETURN other.name AS name, similarity
-                ORDER BY similarity DESC
-                LIMIT $top_k
-            """, {"name": node_name, "top_k": top_k})
-            
-            return [dict(r) for r in result] if result else []
-        except Exception as e:
-            print(f"[KGEmbedder] Error finding similar nodes: {e}")
-            return []
-    
-    def predict_missing_links(
-        self,
-        source_label: str = "Column",
-        target_label: str = "Column",
-        property_name: str = "kg_embedding",
-        threshold: float = 0.8,
-        top_k: int = 20,
-    ) -> List[Dict[str, Any]]:
-        """
-        Predict potential missing FK relationships using embedding similarity.
-        
-        Finds column pairs that are structurally similar (in graph space)
-        but don't have a direct FK relationship.
-        
-        Args:
-            source_label: Label for source nodes
-            target_label: Label for target nodes
-            property_name: Embedding property to use
-            threshold: Minimum similarity threshold
-            top_k: Max results to return
-            
-        Returns:
-            List of predicted links with scores
-        """
-        if not self.check_gds_available():
-            return []
-        
-        try:
-            result = self.neo4j.run_query(f"""
-                // Find column pairs without existing FK
-                MATCH (c1:{source_label})-[:BELONGS_TO]->(t1:Table)
-                MATCH (c2:{target_label})-[:BELONGS_TO]->(t2:Table)
-                WHERE t1 <> t2 
-                  AND c1 <> c2
-                  AND c1.{property_name} IS NOT NULL 
-                  AND c2.{property_name} IS NOT NULL
-                  AND NOT (c1)-[:FK_TO]->(c2)
-                  AND NOT (c2)-[:FK_TO]->(c1)
-                WITH c1, c2, t1, t2,
-                     gds.similarity.cosine(c1.{property_name}, c2.{property_name}) AS similarity
-                WHERE similarity > $threshold
-                RETURN t1.name AS source_table, 
-                       c1.name AS source_column,
-                       t2.name AS target_table,
-                       c2.name AS target_column,
-                       similarity
-                ORDER BY similarity DESC
-                LIMIT $top_k
-            """, {"threshold": threshold, "top_k": top_k})
-            
-            return [dict(r) for r in result] if result else []
-        except Exception as e:
-            print(f"[KGEmbedder] Error predicting missing links: {e}")
-            return []
-    
-    def get_embedding_stats(self, property_name: str = "kg_embedding") -> Dict[str, Any]:
-        """Get statistics about generated embeddings."""
-        try:
-            result = self.neo4j.run_query(f"""
-                MATCH (n)
-                WHERE n.{property_name} IS NOT NULL
-                WITH labels(n) AS lbls, count(n) AS cnt
-                RETURN lbls[0] AS label, cnt AS count
-            """)
-            
-            stats = {}
-            total = 0
-            if result:
-                for r in result:
-                    stats[r["label"]] = r["count"]
-                    total += r["count"]
-            stats["total"] = total
-            
-            return stats
-        except Exception as e:
-            print(f"[KGEmbedder] Error getting embedding stats: {e}")
-            return {"error": str(e)}
-    
-    def drop_graph_projection(self):
-        """Drop the in-memory graph projection to free memory."""
-        try:
-            self.neo4j.run_write(f"CALL gds.graph.drop('{self.graph_name}', false)")
-            print(f"[KGEmbedder] Graph projection dropped")
-        except Exception:
-            pass  # Already dropped or didn't exist
+        return stats
 
 
 def generate_all_kg_embeddings(neo4j_client) -> Dict[str, Any]:
-    """
-    Convenience function to generate KG embeddings for the entire graph.
-    
-    FIXED: Better error handling and detailed status reporting.
+    """Generate knowledge graph embeddings for all entities.
     
     Args:
-        neo4j_client: Neo4j client instance
+        neo4j_client: Neo4jClient instance
         
     Returns:
-        Statistics dict with detailed status
+        Dictionary with embedding statistics
     """
     embedder = KGEmbedder(neo4j_client)
     
     # Check GDS availability
-    gds_status = embedder.get_gds_status()
-    if not gds_status["available"]:
-        print(f"[generate_all_kg_embeddings] GDS not available")
-        return {
-            "error": "Neo4j GDS plugin not available",
-            "gds_status": gds_status,
-            "fix": gds_status.get("fix", "Install Neo4j GDS plugin"),
-        }
+    if not embedder.check_gds_available():
+        return {"error": "Neo4j GDS plugin not available"}
     
-    # Create projection
-    print(f"[generate_all_kg_embeddings] Creating graph projection...")
-    projection_stats = embedder.create_graph_projection()
-    if "error" in projection_stats:
-        return {
-            "error": f"Failed to create graph projection: {projection_stats['error']}",
-            "gds_status": gds_status,
-        }
-    
-    # Check if we have enough nodes
-    if projection_stats.get("nodeCount", 0) < 2:
-        embedder.drop_graph_projection()
-        return {
-            "error": "Not enough nodes for embedding generation (need at least 2)",
-            "projection": projection_stats,
-        }
-    
-    # Check if we have any relationships
-    if projection_stats.get("relationshipCount", 0) == 0:
-        embedder.drop_graph_projection()
-        return {
-            "error": "No relationships found. Run FK discovery first to create relationships.",
-            "projection": projection_stats,
-        }
+    print("[generate_all_kg_embeddings] Starting KG embedding generation...")
     
     # Generate embeddings
-    print(f"[generate_all_kg_embeddings] Generating FastRP embeddings...")
-    embedding_stats = embedder.generate_fastrp_embeddings()
+    stats = embedder.generate_embeddings()
     
-    # Clean up
-    embedder.drop_graph_projection()
+    if stats.get("success"):
+        print(f"[generate_all_kg_embeddings] Success: {stats.get('nodes_written', 0)} nodes embedded")
+    else:
+        print(f"[generate_all_kg_embeddings] Failed: {stats.get('error', 'Unknown error')}")
     
-    if "error" in embedding_stats:
-        return {
-            "error": f"Failed to generate embeddings: {embedding_stats['error']}",
-            "projection": projection_stats,
-        }
-    
-    # Get final stats
-    final_stats = embedder.get_embedding_stats()
-    
-    result = {
-        "success": True,
-        "projection": projection_stats,
-        "embeddings": embedding_stats,
-        "coverage": final_stats,
-    }
-    
-    print(f"[generate_all_kg_embeddings] Complete: {result}")
-    return result
+    return stats
 
 
-def verify_kg_embeddings(neo4j_client) -> Dict[str, Any]:
+def find_similar_nodes(neo4j_client, node_name: str, label: str = None, top_k: int = 5) -> List[Dict]:
+    """Find nodes similar to the given node using KG embeddings.
+    
+    Args:
+        neo4j_client: Neo4jClient instance
+        node_name: Name of the node to find similar nodes for
+        label: Optional label to filter by (Table, Column, Job, Dataset)
+        top_k: Number of results to return
+        
+    Returns:
+        List of similar nodes with similarity scores
     """
-    Verify KG embeddings are properly stored.
+    # Build query based on whether label filter is provided
+    if label:
+        query = f"""
+        MATCH (n:{label} {{name: $name}})
+        WHERE n.kg_embedding IS NOT NULL
+        MATCH (other:{label})
+        WHERE other.kg_embedding IS NOT NULL AND other.name <> $name
+        WITH n, other, gds.similarity.cosine(n.kg_embedding, other.kg_embedding) AS similarity
+        ORDER BY similarity DESC
+        LIMIT $top_k
+        RETURN other.name AS name, labels(other)[0] AS label, similarity
+        """
+    else:
+        query = """
+        MATCH (n {name: $name})
+        WHERE n.kg_embedding IS NOT NULL
+        MATCH (other)
+        WHERE other.kg_embedding IS NOT NULL AND other.name <> $name
+        WITH n, other, gds.similarity.cosine(n.kg_embedding, other.kg_embedding) AS similarity
+        ORDER BY similarity DESC
+        LIMIT $top_k
+        RETURN other.name AS name, labels(other)[0] AS label, similarity
+        """
     
-    Returns detailed coverage statistics.
-    """
-    embedder = KGEmbedder(neo4j_client)
-    
-    result = {
-        "gds_available": embedder.check_gds_available(),
-        "gds_version": embedder._gds_version,
-    }
-    
-    # Check embedding coverage
     try:
-        coverage = neo4j_client.run_query("""
-            MATCH (n)
-            WHERE n:Table OR n:Column OR n:Job OR n:Dataset
-            WITH labels(n)[0] AS label,
-                 n.kg_embedding IS NOT NULL AS has_emb
-            RETURN label,
-                   count(*) AS total,
-                   sum(CASE WHEN has_emb THEN 1 ELSE 0 END) AS with_embedding
-            ORDER BY label
-        """)
-        
-        result["coverage"] = {}
-        total_nodes = 0
-        total_with_emb = 0
-        
-        for row in coverage:
-            label = row["label"]
-            result["coverage"][label] = {
-                "total": row["total"],
-                "with_embedding": row["with_embedding"],
-                "percentage": f"{100 * row['with_embedding'] / row['total']:.1f}%" if row["total"] > 0 else "N/A"
+        results = neo4j_client.run_query(query, {"name": node_name, "top_k": top_k})
+        return [
+            {
+                "name": r.get("name"),
+                "label": r.get("label"),
+                "similarity": r.get("similarity")
             }
-            total_nodes += row["total"]
-            total_with_emb += row["with_embedding"]
-        
-        result["summary"] = {
-            "total_nodes": total_nodes,
-            "with_kg_embedding": total_with_emb,
-            "overall_coverage": f"{100 * total_with_emb / total_nodes:.1f}%" if total_nodes > 0 else "N/A"
-        }
-        
+            for r in results
+        ]
     except Exception as e:
-        result["error"] = f"Failed to check coverage: {e}"
+        print(f"[find_similar_nodes] Error: {e}")
+        return []
+
+
+def predict_fks_from_kg_embeddings(neo4j_client, threshold: float = 0.7, top_k: int = 20) -> List[Dict]:
+    """Predict potential FK relationships using KG embedding similarity.
     
-    return result
+    Finds column pairs that are structurally similar in the graph
+    but don't have an existing FK relationship.
+    
+    Args:
+        neo4j_client: Neo4jClient instance
+        threshold: Minimum similarity score
+        top_k: Maximum number of predictions
+        
+    Returns:
+        List of predicted FK relationships
+    """
+    query = """
+    MATCH (c1:Column)-[:BELONGS_TO]->(t1:Table)
+    MATCH (c2:Column)-[:BELONGS_TO]->(t2:Table)
+    WHERE c1.kg_embedding IS NOT NULL 
+      AND c2.kg_embedding IS NOT NULL
+      AND t1.name <> t2.name
+      AND NOT (c1)-[:FK_TO]-(c2)
+      AND (c1.name CONTAINS 'id' OR c1.name CONTAINS '_id')
+    WITH c1, t1, c2, t2, 
+         gds.similarity.cosine(c1.kg_embedding, c2.kg_embedding) AS similarity
+    WHERE similarity > $threshold
+    ORDER BY similarity DESC
+    LIMIT $top_k
+    RETURN t1.name AS source_table, c1.name AS source_column,
+           t2.name AS target_table, c2.name AS target_column,
+           similarity
+    """
+    
+    try:
+        results = neo4j_client.run_query(query, {
+            "threshold": threshold,
+            "top_k": top_k
+        })
+        return [
+            {
+                "source_table": r.get("source_table"),
+                "source_column": r.get("source_column"),
+                "target_table": r.get("target_table"),
+                "target_column": r.get("target_column"),
+                "similarity": r.get("similarity")
+            }
+            for r in results
+        ]
+    except Exception as e:
+        print(f"[predict_fks_from_kg_embeddings] Error: {e}")
+        return []
