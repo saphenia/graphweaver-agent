@@ -525,8 +525,13 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5,
             if embedder:
                 builder.enable_auto_embedding()
             
-            # Clear and rebuild
-            builder.clear_graph()
+            # FIXED: Only clear schema data, preserve lineage (Jobs/Datasets/READS/WRITES)
+            print("[run_fk_discovery] Clearing schema data (preserving lineage)...")
+            neo4j.run_write("MATCH ()-[r:FK_TO]->() DELETE r")
+            neo4j.run_write("MATCH (c:Column) DETACH DELETE c")
+            neo4j.run_write("MATCH (t:Table) DETACH DELETE t")
+            neo4j.run_write("MATCH (ds:DataSource) DETACH DELETE ds")
+            print("[run_fk_discovery] ✓ Schema cleared")
             
             # Track tables to avoid duplicates
             tables_added = set()
@@ -2182,6 +2187,29 @@ def sync_graph_to_rdf() -> str:
             print(f"[RDF] Found {stats['jobs']} jobs, {stats['datasets']} datasets")
             insert_turtle("\n".join(turtle_lines))
         
+        # Get Dataset-Table REPRESENTS relationships
+        print("[RDF] Querying Neo4j for REPRESENTS relationships...")
+        represents_result = neo4j.run_query("""
+            MATCH (d:Dataset)-[:REPRESENTS]->(t:Table)
+            RETURN d.name as dataset, t.name as table
+        """)
+        
+        stats["represents"] = 0
+        if represents_result:
+            turtle_lines = [PREFIXES]
+            for rep in represents_result:
+                ds_name = rep.get("dataset")
+                table_name = rep.get("table")
+                if ds_name and table_name:
+                    ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
+                    table_uri = f"gwdata:table_{uri_safe(table_name)}"
+                    turtle_lines.append(f'{ds_uri} gw:representsTable {table_uri} .')
+                    stats["represents"] += 1
+            
+            print(f"[RDF] Found {stats['represents']} REPRESENTS relationships")
+            if stats["represents"] > 0:
+                insert_turtle("\n".join(turtle_lines))
+        
         # Get triple count
         count_query = f"SELECT (COUNT(*) as ?count) WHERE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}"
         count_resp = requests.post(
@@ -2208,6 +2236,7 @@ def sync_graph_to_rdf() -> str:
         output += f"- Foreign keys synced: {stats['fks']}\n"
         output += f"- Jobs synced: {stats['jobs']}\n"
         output += f"- Datasets synced: {stats['datasets']}\n"
+        output += f"- Dataset-Table links: {stats.get('represents', 0)}\n"
         output += f"- **Total triples: {total_triples}**\n"
         output += "\nYou can now query the RDF store with SPARQL or access it at http://localhost:3030"
         
