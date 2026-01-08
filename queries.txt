@@ -1,9 +1,19 @@
-PREFIX gw: <http://graphweaver.io/ontology#>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+// to show all tripples:
 
-SELECT ?table ?name WHERE { 
+SELECT * 
+WHERE { 
   GRAPH <http://graphweaver.io/graph/main> { 
-    ?table a gw:Table ;
-           rdfs:label ?name .
+    ?s ?p ?o 
   } 
 }
+
+
+// to see it grouped by type:
+
+SELECT ?type (COUNT(*) as ?count) 
+WHERE { 
+  GRAPH <http://graphweaver.io/graph/main> { 
+    ?s a ?type 
+  } 
+} 
+GROUP BY ?type
