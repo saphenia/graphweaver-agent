@@ -885,33 +885,81 @@ def run_cypher(query: str) -> str:
 def connect_datasets_to_tables() -> str:
     """Connect Dataset nodes to their matching Table nodes in the graph.
     
-    This creates REPRESENTS relationships between Datasets (from lineage)
-    and Tables (from FK discovery) that have the same name, unifying the graph.
+    FIXED: Uses fuzzy matching to handle dataset names like 'ecommerce.orders'
+    matching table 'orders'.
     """
     try:
         neo4j = get_neo4j()
         
-        # Run the merge query
-        result = neo4j.run_query("""
-            MATCH (d:Dataset)
-            MATCH (t:Table)
-            WHERE d.name = t.name
-            MERGE (d)-[:REPRESENTS]->(t)
-            RETURN d.name as dataset, t.name as table
-        """)
+        # Get all datasets and tables
+        datasets = neo4j.run_query("MATCH (d:Dataset) RETURN d.name as name")
+        tables = neo4j.run_query("MATCH (t:Table) RETURN t.name as name")
         
-        if not result:
-            return "No matching Dataset-Table pairs found. Make sure you have both FK discovery results and lineage data in the graph."
+        print(f"[connect_datasets] Found {len(datasets) if datasets else 0} datasets")
+        print(f"[connect_datasets] Found {len(tables) if tables else 0} tables")
         
-        output = f"## Connected {len(result)} Datasets to Tables\n\n"
-        output += "Created REPRESENTS relationships:\n"
-        for row in result:
-            output += f"  Dataset '{row['dataset']}' → Table '{row['table']}'\n"
+        if datasets:
+            print(f"[connect_datasets] Sample datasets: {[d['name'] for d in datasets[:5]]}")
+        if tables:
+            print(f"[connect_datasets] Sample tables: {[t['name'] for t in tables[:5]]}")
+        
+        if not datasets or not tables:
+            msg = "## Diagnostics\n\n"
+            msg += f"- Datasets found: {len(datasets) if datasets else 0}\n"
+            msg += f"- Tables found: {len(tables) if tables else 0}\n\n"
+            if not datasets:
+                msg += "**No Dataset nodes in Neo4j.** Run `import_lineage_to_graph` first.\n"
+            if not tables:
+                msg += "**No Table nodes in Neo4j.** Run `run_fk_discovery` first.\n"
+            return msg
+        
+        # Build table name lookup (lowercase for matching)
+        table_names = {t['name'].lower(): t['name'] for t in tables if t.get('name')}
+        
+        connected = []
+        for ds in datasets:
+            ds_name = ds.get('name', '')
+            if not ds_name:
+                continue
+            
+            # Try to extract table name from dataset name
+            # Handle: "namespace.table", "db.schema.table", "postgres://host/db.table"
+            possible_names = [
+                ds_name,                                    # exact match
+                ds_name.split('.')[-1],                     # last part after dot
+                ds_name.split('/')[-1],                     # last part after slash
+                ds_name.split('.')[-1].split('/')[-1],      # combination
+            ]
+            
+            for possible in possible_names:
+                possible_lower = possible.lower()
+                if possible_lower in table_names:
+                    actual_table = table_names[possible_lower]
+                    # Create relationship
+                    neo4j.run_write("""
+                        MATCH (d:Dataset {name: $ds_name})
+                        MATCH (t:Table {name: $table_name})
+                        MERGE (d)-[:REPRESENTS]->(t)
+                    """, {"ds_name": ds_name, "table_name": actual_table})
+                    connected.append({"dataset": ds_name, "table": actual_table})
+                    print(f"[connect_datasets] ✓ Connected: {ds_name} → {actual_table}")
+                    break
+        
+        if not connected:
+            msg = "No matching Dataset-Table pairs found.\n\n"
+            msg += f"Datasets ({len(datasets)}): {[d['name'] for d in datasets[:10]]}\n"
+            msg += f"Tables ({len(tables)}): {[t['name'] for t in tables[:10]]}"
+            return msg
+        
+        output = f"## Connected {len(connected)} Datasets to Tables\n\n"
+        for conn in connected:
+            output += f"- `{conn['dataset']}` → `{conn['table']}`\n"
         output += "\nThe FK graph and lineage graph are now connected!"
         
         return output
     except Exception as e:
-        return f"ERROR connecting datasets to tables: {type(e).__name__}: {e}"
+        import traceback
+        return f"ERROR connecting datasets to tables: {type(e).__name__}: {e}\n{traceback.format_exc()}"
 
 
 # =============================================================================

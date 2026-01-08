@@ -216,6 +216,53 @@ class MarquezClient:
         """Alias for get_jobs for compatibility."""
         return self.get_jobs(namespace)
     
+    def get_job(self, namespace: str, job_name: str) -> Dict:
+        """Get single job with full details including inputs/outputs.
+        
+        ADDED: The list endpoint doesn't include inputs/outputs, 
+        but the individual job endpoint does.
+        """
+        import requests
+        try:
+            resp = requests.get(
+                f"{self.api_url}/namespaces/{namespace}/jobs/{job_name}",
+                timeout=10
+            )
+            print(f"[MarquezClient] get_job({job_name}): {resp.status_code}")
+            if resp.status_code == 200:
+                job = resp.json()
+                print(f"[MarquezClient]   inputs: {len(job.get('inputs', []))}, outputs: {len(job.get('outputs', []))}")
+                return job
+            return {}
+        except Exception as e:
+            print(f"[MarquezClient] get_job ERROR: {e}")
+            return {}
+    
+    def get_jobs_with_io(self, namespace: str = "default") -> List[Dict]:
+        """Get all jobs WITH their inputs/outputs.
+        
+        ADDED: Fetches each job individually to get full details.
+        """
+        jobs = self.get_jobs(namespace)
+        print(f"[MarquezClient] Fetching details for {len(jobs)} jobs...")
+        
+        detailed_jobs = []
+        for job in jobs:
+            job_name = job.get("name")
+            if job_name:
+                detailed = self.get_job(namespace, job_name)
+                if detailed and (detailed.get("inputs") or detailed.get("outputs")):
+                    detailed_jobs.append(detailed)
+                else:
+                    # Fallback to basic job info
+                    detailed_jobs.append(job)
+        
+        total_inputs = sum(len(j.get("inputs", [])) for j in detailed_jobs)
+        total_outputs = sum(len(j.get("outputs", [])) for j in detailed_jobs)
+        print(f"[MarquezClient] Total: {total_inputs} inputs, {total_outputs} outputs")
+        
+        return detailed_jobs
+    
     def get_lineage(self, dataset_name: str, depth: int = 5) -> Dict:
         """Alias for get_dataset_lineage for compatibility."""
         return self.get_dataset_lineage("default", dataset_name, depth)
@@ -446,15 +493,18 @@ def import_lineage_to_neo4j(
     neo4j_client,  # Neo4jClient
     namespace: str = "default",
 ) -> Dict[str, int]:
-    """Import Marquez lineage data into Neo4j graph."""
+    """Import Marquez lineage data into Neo4j graph.
     
-    print(f"[import_lineage] Fetching jobs from namespace: {namespace}")
+    FIXED: Uses get_jobs_with_io() to fetch full job details including inputs/outputs.
+    """
+    
+    print(f"[import_lineage] Fetching jobs WITH I/O from namespace: {namespace}")
     
     stats = {"jobs": 0, "datasets": 0, "reads": 0, "writes": 0}
     
-    # Get all jobs
-    jobs = marquez_client.get_jobs(namespace)
-    print(f"[import_lineage] Found {len(jobs)} jobs")
+    # FIXED: Use get_jobs_with_io to get full details
+    jobs = marquez_client.get_jobs_with_io(namespace)
+    print(f"[import_lineage] Found {len(jobs)} jobs with details")
     
     for job in jobs:
         job_name = job.get("name")
@@ -475,48 +525,73 @@ def import_lineage_to_neo4j(
         # Get job's inputs/outputs
         for input_ds in job.get("inputs", []):
             ds_name = input_ds.get("name")
+            ds_namespace = input_ds.get("namespace", namespace)
             print(f"[import_lineage]   Input: {ds_name}")
             
-            # Create Dataset node and link to Table if exists
+            # FIXED: Create Dataset node FIRST (separate query)
             neo4j_client.run_write("""
                 MERGE (d:Dataset {name: $name, namespace: $namespace})
-                WITH d
-                OPTIONAL MATCH (t:Table {name: $name})
-                FOREACH (_ IN CASE WHEN t IS NOT NULL THEN [1] ELSE [] END |
-                    MERGE (d)-[:REPRESENTS]->(t)
-                )
-                WITH d
-                MATCH (j:Job {name: $job_name, namespace: $job_namespace})
-                MERGE (j)-[:READS]->(d)
+                SET d.updated_at = datetime()
             """, {
                 "name": ds_name,
-                "namespace": input_ds.get("namespace", namespace),
+                "namespace": ds_namespace,
+            })
+            
+            # FIXED: Create READS relationship (separate query)
+            neo4j_client.run_write("""
+                MATCH (j:Job {name: $job_name, namespace: $job_namespace})
+                MATCH (d:Dataset {name: $ds_name, namespace: $ds_namespace})
+                MERGE (j)-[:READS]->(d)
+            """, {
                 "job_name": job_name,
                 "job_namespace": namespace,
+                "ds_name": ds_name,
+                "ds_namespace": ds_namespace,
             })
+            
+            # FIXED: Link to Table if exists (separate query, optional)
+            neo4j_client.run_write("""
+                MATCH (d:Dataset {name: $name})
+                MATCH (t:Table {name: $name})
+                MERGE (d)-[:REPRESENTS]->(t)
+            """, {"name": ds_name})
+            
             stats["datasets"] += 1
             stats["reads"] += 1
         
         for output_ds in job.get("outputs", []):
             ds_name = output_ds.get("name")
+            ds_namespace = output_ds.get("namespace", namespace)
             print(f"[import_lineage]   Output: {ds_name}")
             
+            # FIXED: Create Dataset node FIRST (separate query)
             neo4j_client.run_write("""
                 MERGE (d:Dataset {name: $name, namespace: $namespace})
-                WITH d
-                OPTIONAL MATCH (t:Table {name: $name})
-                FOREACH (_ IN CASE WHEN t IS NOT NULL THEN [1] ELSE [] END |
-                    MERGE (d)-[:REPRESENTS]->(t)
-                )
-                WITH d
-                MATCH (j:Job {name: $job_name, namespace: $job_namespace})
-                MERGE (j)-[:WRITES]->(d)
+                SET d.updated_at = datetime()
             """, {
                 "name": ds_name,
-                "namespace": output_ds.get("namespace", namespace),
+                "namespace": ds_namespace,
+            })
+            
+            # FIXED: Create WRITES relationship (separate query)
+            neo4j_client.run_write("""
+                MATCH (j:Job {name: $job_name, namespace: $job_namespace})
+                MATCH (d:Dataset {name: $ds_name, namespace: $ds_namespace})
+                MERGE (j)-[:WRITES]->(d)
+            """, {
                 "job_name": job_name,
                 "job_namespace": namespace,
+                "ds_name": ds_name,
+                "ds_namespace": ds_namespace,
             })
+            
+            # FIXED: Link to Table if exists (separate query, optional)
+            neo4j_client.run_write("""
+                MATCH (d:Dataset {name: $name})
+                MATCH (t:Table {name: $name})
+                MERGE (d)-[:REPRESENTS]->(t)
+            """, {"name": ds_name})
+            
             stats["datasets"] += 1
             stats["writes"] += 1
     
