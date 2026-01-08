@@ -6,6 +6,12 @@ from graphweaver_agent.models import Neo4jConfig
 
 
 class Neo4jClient:
+    """Neo4j client with proper transaction handling.
+    
+    FIXED: Uses execute_write/execute_read for proper transaction semantics
+    which ensures writes are committed and visible before returning.
+    """
+    
     def __init__(self, config: Neo4jConfig):
         self.config = config
         self._driver = None
@@ -33,15 +39,64 @@ class Neo4jClient:
             session.close()
     
     def run_query(self, query: str, params: Optional[Dict] = None) -> List[Dict]:
-        with self.session() as session:
-            result = session.run(query, params or {})
+        """Execute a read query with proper transaction handling."""
+        def _read_tx(tx, q, p):
+            result = tx.run(q, p)
             return [dict(record) for record in result]
-    
-    def run_write(self, query: str, params: Optional[Dict] = None):
+        
         with self.session() as session:
-            p = params or {}
-            result = session.run(query, p)
-            result.consume()
+            return session.execute_read(_read_tx, query, params or {})
+    
+    def run_write(self, query: str, params: Optional[Dict] = None) -> Optional[List[Dict]]:
+        """Execute a write query with proper transaction handling.
+        
+        FIXED: Uses execute_write() which ensures the transaction is 
+        committed before returning, making writes immediately visible.
+        """
+        def _write_tx(tx, q, p):
+            result = tx.run(q, p)
+            # Consume and return summary for verification
+            try:
+                records = [dict(record) for record in result]
+                return records
+            except:
+                result.consume()
+                return None
+        
+        with self.session() as session:
+            return session.execute_write(_write_tx, query, params or {})
+    
+    def run_write_batch(self, queries: List[tuple]) -> int:
+        """Execute multiple write queries in a single transaction.
+        
+        Args:
+            queries: List of (query, params) tuples
+            
+        Returns:
+            Number of queries executed
+        """
+        def _batch_write_tx(tx, query_list):
+            count = 0
+            for query, params in query_list:
+                result = tx.run(query, params or {})
+                result.consume()
+                count += 1
+            return count
+        
+        with self.session() as session:
+            return session.execute_write(_batch_write_tx, queries)
+    
+    def verify_nodes_exist(self, label: str, min_count: int = 1) -> bool:
+        """Verify that nodes with given label exist.
+        
+        Useful for confirming writes completed successfully.
+        """
+        result = self.run_query(
+            f"MATCH (n:{label}) RETURN count(n) as cnt"
+        )
+        if result:
+            return result[0].get('cnt', 0) >= min_count
+        return False
 
     def test_connection(self) -> Dict[str, Any]:
         try:

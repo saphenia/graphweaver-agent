@@ -1034,10 +1034,18 @@ def impl_import_lineage_to_graph() -> str:
     try:
         stats = import_lineage_to_neo4j(get_marquez(), get_neo4j())
         output = "## Lineage Imported to Neo4j\n\n"
-        output += f"- Jobs imported: {stats.get('jobs', 0)}\n"
-        output += f"- Datasets imported: {stats.get('datasets', 0)}\n"
+        output += f"- Jobs processed: {stats.get('jobs', 0)}\n"
+        output += f"- Datasets processed: {stats.get('datasets', 0)}\n"
         output += f"- READS relationships: {stats.get('reads', 0)}\n"
         output += f"- WRITES relationships: {stats.get('writes', 0)}\n"
+        
+        # Show verified counts from Neo4j
+        if 'actual_jobs' in stats:
+            output += "\n### Verified in Neo4j:\n"
+            output += f"- Jobs: {stats.get('actual_jobs', 0)}\n"
+            output += f"- Datasets: {stats.get('actual_datasets', 0)}\n"
+            output += f"- READS edges: {stats.get('actual_reads', 0)}\n"
+            output += f"- WRITES edges: {stats.get('actual_writes', 0)}\n"
         
         # Diagnostic if no relationships
         total_rels = stats.get('reads', 0) + stats.get('writes', 0)

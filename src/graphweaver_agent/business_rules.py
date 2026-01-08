@@ -595,6 +595,28 @@ def import_lineage_to_neo4j(
             stats["datasets"] += 1
             stats["writes"] += 1
     
+    # VERIFY: Confirm writes are visible
+    print("[import_lineage] Verifying writes...")
+    
+    verify_jobs = neo4j_client.run_query("MATCH (j:Job) RETURN count(j) as cnt")
+    verify_datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN count(d) as cnt")
+    verify_reads = neo4j_client.run_query("MATCH ()-[r:READS]->() RETURN count(r) as cnt")
+    verify_writes = neo4j_client.run_query("MATCH ()-[r:WRITES]->() RETURN count(r) as cnt")
+    
+    actual_jobs = verify_jobs[0]['cnt'] if verify_jobs else 0
+    actual_datasets = verify_datasets[0]['cnt'] if verify_datasets else 0
+    actual_reads = verify_reads[0]['cnt'] if verify_reads else 0
+    actual_writes = verify_writes[0]['cnt'] if verify_writes else 0
+    
+    print(f"[import_lineage] Verification: {actual_jobs} jobs, {actual_datasets} datasets, "
+          f"{actual_reads} READS, {actual_writes} WRITES in Neo4j")
+    
+    # Update stats with actual counts (in case of duplicates from re-runs)
+    stats["actual_jobs"] = actual_jobs
+    stats["actual_datasets"] = actual_datasets
+    stats["actual_reads"] = actual_reads
+    stats["actual_writes"] = actual_writes
+    
     print(f"[import_lineage] Import complete: {stats}")
     return stats
 
