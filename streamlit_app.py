@@ -1233,6 +1233,10 @@ def impl_sync_graph_to_rdf() -> str:
         PREFIXES = """@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix dcat: <http://www.w3.org/ns/dcat#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
 @prefix gw: <http://graphweaver.io/ontology#> .
 @prefix gwdata: <http://graphweaver.io/data#> .
 
@@ -1245,15 +1249,23 @@ def impl_sync_graph_to_rdf() -> str:
         
         turtle_lines = [PREFIXES]
         stats = {"tables": 0, "columns": 0, "jobs": 0, "datasets": 0, 
-                 "datasources": 0, "fks": 0, "reads": 0, "writes": 0, "represents": 0}
+                 "datasources": 0, "fks": 0, "reads": 0, "writes": 0, "represents": 0,
+                 "table_fks": 0, "col_props": 0, "belongs_to": 0}
         
-        # 1. TABLES with columns
-        log("[QUERY] Fetching tables and columns...")
+        # 1. TABLES with columns (enhanced with more properties)
+        log("[QUERY] Fetching tables and columns with full metadata...")
         tables = neo4j.run_query("""
             MATCH (t:Table)
+            OPTIONAL MATCH (t)-[:BELONGS_TO]->(ds:DataSource)
             OPTIONAL MATCH (t)<-[:BELONGS_TO]-(c:Column)
-            WITH t, collect({name: c.name, dataType: c.data_type}) as columns
-            RETURN t.name as name, columns
+            WITH t, ds, collect({
+                name: c.name, 
+                dataType: c.data_type,
+                isPK: c.is_primary_key,
+                isNullable: c.is_nullable,
+                isUnique: c.is_unique
+            }) as columns
+            RETURN t.name as name, ds.id as datasource, columns
         """)
         
         for table in (tables or []):
@@ -1261,15 +1273,47 @@ def impl_sync_graph_to_rdf() -> str:
             if not table_name:
                 continue
             table_uri = f"gwdata:table_{uri_safe(table_name)}"
-            turtle_lines.append(f'{table_uri} a gw:Table ; rdfs:label "{table_name}" .')
+            ds_id = table.get("datasource") or "default"
+            ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
+            
+            # Table triples
+            turtle_lines.append(f'{table_uri} a gw:Table, dcat:Dataset ;')
+            turtle_lines.append(f'    rdfs:label "{table_name}" ;')
+            turtle_lines.append(f'    dct:identifier "{table_name}" ;')
+            turtle_lines.append(f'    gw:belongsToDataSource {ds_uri} .')
             stats["tables"] += 1
+            stats["belongs_to"] += 1
             
             for col in table.get("columns", []):
                 col_name = col.get("name") if col else None
                 if col_name:
                     col_uri = f"gwdata:column_{uri_safe(table_name)}_{uri_safe(col_name)}"
                     data_type = col.get("dataType") or "unknown"
-                    turtle_lines.append(f'{col_uri} a gw:Column ; rdfs:label "{col_name}" ; gw:dataType "{data_type}" ; gw:belongsToTable {table_uri} .')
+                    is_pk = col.get("isPK") or False
+                    is_nullable = col.get("isNullable")
+                    is_unique = col.get("isUnique") or False
+                    
+                    # Column triples with more properties
+                    turtle_lines.append(f'{col_uri} a gw:Column ;')
+                    turtle_lines.append(f'    rdfs:label "{col_name}" ;')
+                    turtle_lines.append(f'    gw:columnName "{col_name}" ;')
+                    turtle_lines.append(f'    gw:dataType "{data_type}" ;')
+                    turtle_lines.append(f'    gw:belongsToTable {table_uri} ;')
+                    if is_pk:
+                        turtle_lines.append(f'    gw:isPrimaryKey "true"^^xsd:boolean ;')
+                        stats["col_props"] += 1
+                    if is_unique:
+                        turtle_lines.append(f'    gw:isUnique "true"^^xsd:boolean ;')
+                        stats["col_props"] += 1
+                    if is_nullable is not None:
+                        turtle_lines.append(f'    gw:isNullable "{str(is_nullable).lower()}"^^xsd:boolean ;')
+                        stats["col_props"] += 1
+                    # Remove trailing semicolon and close with period
+                    if turtle_lines[-1].endswith(' ;'):
+                        turtle_lines[-1] = turtle_lines[-1][:-2] + ' .'
+                    else:
+                        turtle_lines.append('.')
+                    
                     turtle_lines.append(f'{table_uri} gw:hasColumn {col_uri} .')
                     stats["columns"] += 1
         
@@ -1325,7 +1369,7 @@ def impl_sync_graph_to_rdf() -> str:
         
         log(f"[DATASETS] {stats['datasets']} datasets")
         
-        # 4. DATASOURCES
+        # 4. DATASOURCES and Table-DataSource relationships
         log("[QUERY] Fetching datasources...")
         datasources = neo4j.run_query("MATCH (ds:DataSource) RETURN ds.id as id")
         
@@ -1338,7 +1382,26 @@ def impl_sync_graph_to_rdf() -> str:
         
         log(f"[DATASOURCES] {stats['datasources']} datasources")
         
-        # 5. FK_TO relationships
+        # 4b. Table -> DataSource BELONGS_TO relationships
+        log("[QUERY] Fetching Table-DataSource relationships...")
+        table_ds = neo4j.run_query("""
+            MATCH (t:Table)-[:BELONGS_TO]->(ds:DataSource)
+            RETURN t.name as table, ds.id as datasource
+        """)
+        
+        stats["table_datasource"] = 0
+        for rel in (table_ds or []):
+            table_name = rel.get("table")
+            ds_id = rel.get("datasource")
+            if table_name and ds_id:
+                table_uri = f"gwdata:table_{uri_safe(table_name)}"
+                ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
+                turtle_lines.append(f'{table_uri} gw:belongsToDataSource {ds_uri} .')
+                stats["table_datasource"] += 1
+        
+        log(f"[TABLE-DS] {stats['table_datasource']} Table-DataSource relationships")
+        
+        # 5. FK_TO relationships (with cardinality)
         log("[QUERY] Fetching FK relationships...")
         fks = neo4j.run_query("""
             MATCH (sc:Column)-[fk:FK_TO]->(tc:Column)
@@ -1346,18 +1409,30 @@ def impl_sync_graph_to_rdf() -> str:
             MATCH (tc)-[:BELONGS_TO]->(tt:Table)
             RETURN st.name as srcTable, sc.name as srcCol, 
                    tt.name as tgtTable, tc.name as tgtCol,
-                   fk.confidence as confidence
+                   fk.score as confidence, fk.cardinality as cardinality
         """)
         
         for fk in (fks or []):
             src_uri = f"gwdata:column_{uri_safe(fk['srcTable'])}_{uri_safe(fk['srcCol'])}"
             tgt_uri = f"gwdata:column_{uri_safe(fk['tgtTable'])}_{uri_safe(fk['tgtCol'])}"
+            src_table_uri = f"gwdata:table_{uri_safe(fk['srcTable'])}"
+            tgt_table_uri = f"gwdata:table_{uri_safe(fk['tgtTable'])}"
             conf = fk.get("confidence") or 1.0
+            card = fk.get("cardinality") or "unknown"
+            
+            # Column-to-Column FK
             turtle_lines.append(f'{src_uri} gw:referencesColumn {tgt_uri} .')
             turtle_lines.append(f'{src_uri} gw:fkConfidence "{conf}"^^xsd:float .')
+            turtle_lines.append(f'{src_uri} gw:fkCardinality "{card}" .')
+            
+            # Table-to-Table FK (for easier querying)
+            turtle_lines.append(f'{src_table_uri} gw:referencesTable {tgt_table_uri} .')
+            turtle_lines.append(f'{tgt_table_uri} gw:referencedByTable {src_table_uri} .')
+            stats["table_fks"] += 1
+            
             stats["fks"] += 1
         
-        log(f"[FKs] {stats['fks']} FK relationships")
+        log(f"[FKs] {stats['fks']} column FKs, {stats.get('table_fks', 0)} table FKs")
         
         # 6. READS relationships
         log("[QUERY] Fetching READS relationships...")
@@ -1453,12 +1528,14 @@ def impl_sync_graph_to_rdf() -> str:
         output = "## ★ Graph Synced to RDF ★\n\n"
         output += "### Nodes Synced:\n"
         output += f"- Tables: {stats['tables']}\n"
-        output += f"- Columns: {stats['columns']}\n"
+        output += f"- Columns: {stats['columns']} (with {stats.get('col_props', 0)} extra properties)\n"
         output += f"- Jobs: {stats['jobs']}\n"
         output += f"- Datasets: {stats['datasets']}\n"
         output += f"- DataSources: {stats['datasources']}\n\n"
         output += "### Relationships Synced:\n"
-        output += f"- FK references: {stats['fks']}\n"
+        output += f"- Column FK references: {stats['fks']}\n"
+        output += f"- Table FK references: {stats.get('table_fks', 0)}\n"
+        output += f"- Table-DataSource: {stats.get('belongs_to', 0)}\n"
         output += f"- READS (lineage): {stats['reads']}\n"
         output += f"- WRITES (lineage): {stats['writes']}\n"
         output += f"- REPRESENTS: {stats['represents']}\n\n"
