@@ -3,6 +3,7 @@
 #
 # Usage:
 #   docker compose up
+#   DEBUG=1 docker compose up   # with debug logging
 #
 # This starts:
 #   - PostgreSQL with sample database
@@ -128,6 +129,7 @@ services:
     tty: true
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DEBUG: ${DEBUG:-0}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: orders
@@ -164,6 +166,7 @@ services:
       - "8501:8501"
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      DEBUG: ${DEBUG:-0}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: orders

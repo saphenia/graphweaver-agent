@@ -5,20 +5,58 @@ The knowledge base contains:
 - Axioms: Facts that are known to be true
 - Constraints: Rules that should be satisfied
 - Queries: Logical questions to answer
+
+FIXED: Lazy loading of TensorFlow/LTN to avoid conflicts with sentence-transformers.
 """
 from typing import Dict, List, Any, Optional, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
 
-try:
-    import ltn
-    import tensorflow as tf
-    LTN_AVAILABLE = True
-except ImportError:
-    LTN_AVAILABLE = False
-    tf = None
-    ltn = None
+# Lazy-loaded modules
+_ltn = None
+_tf = None
+_LTN_AVAILABLE = None
+
+
+def _ensure_ltn_loaded():
+    """Lazy load LTN and TensorFlow only when needed."""
+    global _ltn, _tf, _LTN_AVAILABLE
+    
+    if _LTN_AVAILABLE is None:
+        try:
+            import ltn
+            import tensorflow as tf
+            _ltn = ltn
+            _tf = tf
+            _LTN_AVAILABLE = True
+        except ImportError:
+            _LTN_AVAILABLE = False
+            _ltn = None
+            _tf = None
+    
+    return _LTN_AVAILABLE
+
+
+def get_ltn():
+    """Get the ltn module (lazy loaded)."""
+    _ensure_ltn_loaded()
+    if _ltn is None:
+        raise ImportError("LTN not installed. Run: pip install ltn tensorflow")
+    return _ltn
+
+
+def get_tf():
+    """Get the tensorflow module (lazy loaded)."""
+    _ensure_ltn_loaded()
+    if _tf is None:
+        raise ImportError("TensorFlow not installed. Run: pip install tensorflow")
+    return _tf
+
+
+def is_ltn_available() -> bool:
+    """Check if LTN is available without triggering import."""
+    return _ensure_ltn_loaded()
 
 
 class AxiomType(Enum):
@@ -64,28 +102,82 @@ class LTNKnowledgeBase:
         self.predicates: Dict[str, Any] = {}
         self.functions: Dict[str, Any] = {}
         
-        # Fuzzy operators
-        if LTN_AVAILABLE:
-            self.Not = ltn.Wrapper_Connective(ltn.fuzzy_ops.Not_Std())
-            self.And = ltn.Wrapper_Connective(ltn.fuzzy_ops.And_Prod())
-            self.Or = ltn.Wrapper_Connective(ltn.fuzzy_ops.Or_ProbSum())
-            self.Implies = ltn.Wrapper_Connective(ltn.fuzzy_ops.Implies_Reichenbach())
-            self.Equiv = ltn.Wrapper_Connective(ltn.fuzzy_ops.Equiv(and_op=ltn.fuzzy_ops.And_Prod(), implies_op=ltn.fuzzy_ops.Implies_Reichenbach()))
-            self.Forall = ltn.Wrapper_Quantifier(ltn.fuzzy_ops.Aggreg_pMeanError(p=2), semantics="forall")
-            self.Exists = ltn.Wrapper_Quantifier(ltn.fuzzy_ops.Aggreg_pMean(p=2), semantics="exists")
+        # Fuzzy operators - lazy initialized
+        self._operators_initialized = False
+        self._Not = None
+        self._And = None
+        self._Or = None
+        self._Implies = None
+        self._Equiv = None
+        self._Forall = None
+        self._Exists = None
+    
+    def _init_operators(self):
+        """Initialize LTN fuzzy operators (lazy)."""
+        if self._operators_initialized:
+            return
+        
+        if not _ensure_ltn_loaded():
+            return
+        
+        ltn = get_ltn()
+        self._Not = ltn.Wrapper_Connective(ltn.fuzzy_ops.Not_Std())
+        self._And = ltn.Wrapper_Connective(ltn.fuzzy_ops.And_Prod())
+        self._Or = ltn.Wrapper_Connective(ltn.fuzzy_ops.Or_ProbSum())
+        self._Implies = ltn.Wrapper_Connective(ltn.fuzzy_ops.Implies_Reichenbach())
+        self._Equiv = ltn.Wrapper_Connective(ltn.fuzzy_ops.Equiv(
+            and_op=ltn.fuzzy_ops.And_Prod(), 
+            implies_op=ltn.fuzzy_ops.Implies_Reichenbach()
+        ))
+        self._Forall = ltn.Wrapper_Quantifier(ltn.fuzzy_ops.Aggreg_pMeanError(p=2), semantics="forall")
+        self._Exists = ltn.Wrapper_Quantifier(ltn.fuzzy_ops.Aggreg_pMean(p=2), semantics="exists")
+        self._operators_initialized = True
+    
+    @property
+    def Not(self):
+        self._init_operators()
+        return self._Not
+    
+    @property
+    def And(self):
+        self._init_operators()
+        return self._And
+    
+    @property
+    def Or(self):
+        self._init_operators()
+        return self._Or
+    
+    @property
+    def Implies(self):
+        self._init_operators()
+        return self._Implies
+    
+    @property
+    def Equiv(self):
+        self._init_operators()
+        return self._Equiv
+    
+    @property
+    def Forall(self):
+        self._init_operators()
+        return self._Forall
+    
+    @property
+    def Exists(self):
+        self._init_operators()
+        return self._Exists
     
     def add_constant(self, name: str, value: np.ndarray) -> Any:
         """Add a constant (grounded entity)."""
-        if not LTN_AVAILABLE:
-            raise ImportError("LTN not installed")
+        ltn = get_ltn()
         const = ltn.Constant(value, trainable=False)
         self.constants[name] = const
         return const
     
     def add_variable(self, name: str, values: np.ndarray) -> Any:
         """Add a variable (set of entities)."""
-        if not LTN_AVAILABLE:
-            raise ImportError("LTN not installed")
+        ltn = get_ltn()
         var = ltn.Variable(name, values)
         self.variables[name] = var
         return var

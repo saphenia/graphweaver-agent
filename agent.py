@@ -505,42 +505,58 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5,
         output += f"- Duration: {summary['duration_seconds']}s\n\n"
         
         # =====================================================================
-        # PERSIST TO NEO4J WITH AUTO-EMBEDDING
+        # ALWAYS PERSIST TO NEO4J (even if no FKs discovered)
         # =====================================================================
-        if result["discovered_fks"]:
-            try:
-                neo4j = get_neo4j()
-                pg = get_pg()
-                
-                # Initialize embedder if auto_embed is enabled
-                embedder = None
-                if auto_embed and EMBEDDINGS_AVAILABLE:
-                    try:
-                        embedder = TextEmbedder.get_shared_instance()
-                        print("[run_fk_discovery] Auto-embedding enabled")
-                    except Exception as emb_err:
-                        print(f"[run_fk_discovery] WARNING: Could not load embedder: {emb_err}")
-                
-                # Create GraphBuilder with optional embedder
-                builder = GraphBuilder(neo4j, embedder=embedder)
-                if embedder:
-                    builder.enable_auto_embedding()
-                
-                # Clear and rebuild
-                builder.clear_graph()
-                
-                # Track tables to avoid duplicates
-                tables_added = set()
-                
-                # Pre-fetch column metadata for better embeddings
-                table_columns = {}
+        try:
+            neo4j = get_neo4j()
+            pg = get_pg()
+            
+            # Initialize embedder if auto_embed is enabled
+            embedder = None
+            if auto_embed and EMBEDDINGS_AVAILABLE:
                 try:
-                    for table in pg.get_tables():
-                        meta = pg.get_table_metadata(table)
-                        table_columns[table] = [c.column_name for c in meta.columns]
-                except Exception as meta_err:
-                    print(f"[run_fk_discovery] Warning: Could not get column metadata: {meta_err}")
-                
+                    embedder = TextEmbedder.get_shared_instance()
+                    print("[run_fk_discovery] Auto-embedding enabled")
+                except Exception as emb_err:
+                    print(f"[run_fk_discovery] WARNING: Could not load embedder: {emb_err}")
+            
+            # Create GraphBuilder with optional embedder
+            builder = GraphBuilder(neo4j, embedder=embedder)
+            if embedder:
+                builder.enable_auto_embedding()
+            
+            # Clear and rebuild
+            builder.clear_graph()
+            
+            # Track tables to avoid duplicates
+            tables_added = set()
+            
+            # Pre-fetch ALL tables and column metadata
+            table_columns = {}
+            all_tables = []
+            try:
+                all_tables = pg.get_tables()
+                for table in all_tables:
+                    meta = pg.get_table_metadata(table)
+                    table_columns[table] = [c.column_name for c in meta.columns]
+            except Exception as meta_err:
+                print(f"[run_fk_discovery] Warning: Could not get column metadata: {meta_err}")
+            
+            # ALWAYS add all tables to Neo4j (even if no FKs)
+            for table in all_tables:
+                if table not in tables_added:
+                    builder.add_table(
+                        table,
+                        column_names=table_columns.get(table, [])
+                    )
+                    # Also add columns explicitly
+                    for col_name in table_columns.get(table, []):
+                        builder.add_column(table, col_name)
+                    tables_added.add(table)
+            
+            # Add FK relationships if any were discovered
+            fks_added = 0
+            if result["discovered_fks"]:
                 for fk in result["discovered_fks"]:
                     rel = fk["relationship"]
                     # Parse "source_table.source_col → target_table.target_col"
@@ -551,20 +567,6 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5,
                     src_table, src_col = src_parts[0], src_parts[1]
                     tgt_table, tgt_col = tgt_parts[0], tgt_parts[1]
                     
-                    # Add tables if not already added (with column names for embedding)
-                    if src_table not in tables_added:
-                        builder.add_table(
-                            src_table, 
-                            column_names=table_columns.get(src_table, [])
-                        )
-                        tables_added.add(src_table)
-                    if tgt_table not in tables_added:
-                        builder.add_table(
-                            tgt_table,
-                            column_names=table_columns.get(tgt_table, [])
-                        )
-                        tables_added.add(tgt_table)
-                    
                     # Add FK relationship (columns get auto-embedded if enabled)
                     builder.add_fk_relationship(
                         src_table, src_col,
@@ -572,33 +574,36 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5,
                         fk["confidence"],
                         fk["cardinality"]
                     )
-                
-                output += f"### ✓ Persisted to Neo4j\n"
-                output += f"- Tables added: {len(tables_added)}\n"
-                output += f"- FK relationships added: {len(result['discovered_fks'])}\n"
-                
-                # Report embedding status
-                if embedder:
-                    try:
-                        coverage = builder.ensure_embeddings_exist()
-                        output += f"\n### ✓ Embeddings Generated\n"
-                        output += f"- Total nodes: {coverage['total']}\n"
-                        output += f"- With embeddings: {coverage['with_embedding']}\n"
-                        output += f"- Coverage: {coverage['coverage']}\n"
-                        if coverage['missing'] > 0:
-                            output += f"- ⚠ Missing: {coverage['missing']} nodes\n"
-                    except Exception as cov_err:
-                        output += f"\n⚠ Could not verify embeddings: {cov_err}\n"
-                else:
-                    output += "\n⚠ **Embeddings not generated.** "
-                    output += "Run `generate_text_embeddings` to enable semantic search.\n"
-                
-                output += "\n"
-                
-            except Exception as e:
-                import traceback
-                output += f"### ⚠ Neo4j Error: {e}\n"
-                output += f"```\n{traceback.format_exc()}\n```\n\n"
+                    fks_added += 1
+            
+            output += f"### ✓ Persisted to Neo4j\n"
+            output += f"- Tables added: {len(tables_added)}\n"
+            total_columns = sum(len(cols) for cols in table_columns.values())
+            output += f"- Columns added: {total_columns}\n"
+            output += f"- FK relationships added: {fks_added}\n"
+            
+            # Report embedding status
+            if embedder:
+                try:
+                    coverage = builder.ensure_embeddings_exist()
+                    output += f"\n### ✓ Embeddings Generated\n"
+                    output += f"- Total nodes: {coverage['total']}\n"
+                    output += f"- With embeddings: {coverage['with_embedding']}\n"
+                    output += f"- Coverage: {coverage['coverage']}\n"
+                    if coverage['missing'] > 0:
+                        output += f"- ⚠ Missing: {coverage['missing']} nodes\n"
+                except Exception as cov_err:
+                    output += f"\n⚠ Could not verify embeddings: {cov_err}\n"
+            else:
+                output += "\n⚠ **Embeddings not generated.** "
+                output += "Run `generate_text_embeddings` to enable semantic search.\n"
+            
+            output += "\n"
+            
+        except Exception as e:
+            import traceback
+            output += f"### ⚠ Neo4j Error: {e}\n"
+            output += f"```\n{traceback.format_exc()}\n```\n\n"
         
         # List discovered FKs
         output += "### Discovered Foreign Keys\n\n"
@@ -937,19 +942,32 @@ def generate_text_embeddings() -> str:
         print("[generate_text_embeddings] Calling embed_all_metadata...")
         
         # Actually call the function
-        stats = embed_all_metadata(
+        result = embed_all_metadata(
             neo4j_client=neo4j,
             pg_connector=pg,
             embedder=embedder,
         )
         
-        print(f"[generate_text_embeddings] Done: {stats}")
+        print(f"[generate_text_embeddings] Done: {result}")
+        
+        # Handle error/warning responses from embed_all_metadata
+        if "error" in result:
+            return f"ERROR generating embeddings: {result['error']}"
+        if "warning" in result:
+            return f"WARNING: {result['warning']}"
+        
+        # Extract stats (may be nested under 'stats' key or at top level)
+        stats = result.get("stats", result)
         
         output = "## Text Embeddings Generated\n\n"
-        output += f"- Tables embedded: {stats['tables']}\n"
-        output += f"- Columns embedded: {stats['columns']}\n"
-        output += f"- Jobs embedded: {stats['jobs']}\n"
-        output += f"- Datasets embedded: {stats['datasets']}\n"
+        output += f"- Tables embedded: {stats.get('tables', 0)}\n"
+        output += f"- Columns embedded: {stats.get('columns', 0)}\n"
+        output += f"- Jobs embedded: {stats.get('jobs', 0)}\n"
+        output += f"- Datasets embedded: {stats.get('datasets', 0)}\n"
+        
+        if stats.get('error_count', 0) > 0:
+            output += f"\n⚠️ {stats['error_count']} errors occurred during embedding.\n"
+        
         output += "\nText embeddings are now stored on Neo4j nodes."
         output += "\nYou can now use semantic_search_tables and semantic_search_columns."
         
@@ -1781,6 +1799,140 @@ def find_impact_analysis(table_name: str) -> str:
 # =============================================================================
 
 @tool
+def debug_rdf_sync() -> str:
+    """DEBUG: Test RDF sync step by step with detailed logging.
+    
+    This will:
+    1. Test Fuseki connection
+    2. Insert a test triple
+    3. Query it back
+    4. Show what's in Neo4j
+    5. Try the actual sync
+    """
+    import requests
+    output = "## RDF Debug Report\n\n"
+    
+    try:
+        fuseki = get_fuseki()
+        
+        # Step 1: Test connection
+        output += "### Step 1: Connection Test\n"
+        output += f"- URL: {fuseki.config.url}\n"
+        output += f"- Dataset: {fuseki.config.dataset}\n"
+        output += f"- Base URL: {fuseki.base_url}\n"
+        
+        try:
+            resp = requests.get(f"{fuseki.config.url}/$/ping", timeout=5)
+            output += f"- Ping status: {resp.status_code}\n"
+        except Exception as e:
+            output += f"- Ping FAILED: {e}\n"
+            return output
+        
+        # Step 2: Check dataset exists
+        output += "\n### Step 2: Dataset Check\n"
+        try:
+            resp = requests.get(
+                f"{fuseki.config.url}/$/datasets/{fuseki.config.dataset}",
+                auth=fuseki.auth, timeout=5
+            )
+            output += f"- Dataset exists: {resp.status_code == 200}\n"
+            if resp.status_code != 200:
+                output += f"- Response: {resp.text[:200]}\n"
+        except Exception as e:
+            output += f"- Dataset check FAILED: {e}\n"
+        
+        # Step 3: Insert test triple
+        output += "\n### Step 3: Insert Test Triple\n"
+        test_turtle = """
+@prefix gw: <http://graphweaver.io/ontology#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<http://graphweaver.io/data#test_table> a gw:Table ; rdfs:label "TEST_TABLE" .
+"""
+        graph_uri = "http://graphweaver.io/graph/main"
+        url = f"{fuseki.base_url}/data?graph={graph_uri}"
+        output += f"- Insert URL: {url}\n"
+        
+        try:
+            resp = requests.post(
+                url,
+                data=test_turtle.encode('utf-8'),
+                headers={"Content-Type": "text/turtle; charset=utf-8"},
+                auth=fuseki.auth,
+                timeout=10
+            )
+            output += f"- Insert status: {resp.status_code}\n"
+            if resp.status_code not in [200, 201, 204]:
+                output += f"- Insert response: {resp.text[:300]}\n"
+        except Exception as e:
+            output += f"- Insert FAILED: {e}\n"
+        
+        # Step 4: Query the test triple
+        output += "\n### Step 4: Query Test Triple\n"
+        query = f"""
+PREFIX gw: <http://graphweaver.io/ontology#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT ?s ?label WHERE {{
+    GRAPH <{graph_uri}> {{
+        ?s a gw:Table ; rdfs:label ?label .
+    }}
+}}
+"""
+        try:
+            resp = requests.post(
+                f"{fuseki.base_url}/sparql",
+                data={"query": query},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout=10
+            )
+            output += f"- Query status: {resp.status_code}\n"
+            if resp.status_code == 200:
+                results = resp.json()
+                bindings = results.get("results", {}).get("bindings", [])
+                output += f"- Results found: {len(bindings)}\n"
+                for b in bindings[:5]:
+                    output += f"  - {b.get('label', {}).get('value', 'N/A')}\n"
+            else:
+                output += f"- Query response: {resp.text[:200]}\n"
+        except Exception as e:
+            output += f"- Query FAILED: {e}\n"
+        
+        # Step 5: Count triples in named graph
+        output += "\n### Step 5: Triple Count\n"
+        count_query = f"SELECT (COUNT(*) as ?count) WHERE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}"
+        count = fuseki.get_triple_count(graph_uri)
+        output += f"- Triples in named graph: {count}\n"
+        
+        default_count = fuseki.get_triple_count()
+        output += f"- Triples in default graph: {default_count}\n"
+        
+        # Step 6: Check Neo4j data
+        output += "\n### Step 6: Neo4j Data Check\n"
+        try:
+            neo4j = get_neo4j()
+            tables = neo4j.run_query("MATCH (t:Table) RETURN count(t) as cnt")
+            columns = neo4j.run_query("MATCH (c:Column) RETURN count(c) as cnt")
+            fks = neo4j.run_query("MATCH ()-[r:FK_TO]->() RETURN count(r) as cnt")
+            
+            t_cnt = tables[0]["cnt"] if tables else 0
+            c_cnt = columns[0]["cnt"] if columns else 0
+            f_cnt = fks[0]["cnt"] if fks else 0
+            
+            output += f"- Tables in Neo4j: {t_cnt}\n"
+            output += f"- Columns in Neo4j: {c_cnt}\n"
+            output += f"- FK relationships: {f_cnt}\n"
+        except Exception as e:
+            output += f"- Neo4j check FAILED: {e}\n"
+        
+        return output
+        
+    except Exception as e:
+        import traceback
+        return f"DEBUG ERROR: {e}\n{traceback.format_exc()}"
+
+
+@tool
 def test_rdf_connection() -> str:
     """Test connection to the RDF triple store (Apache Jena Fuseki).
     
@@ -1812,32 +1964,203 @@ def sync_graph_to_rdf() -> str:
     
     The RDF store uses standard ontologies (DCAT, PROV-O, Dublin Core)
     for interoperability with other data catalog systems.
+    
+    FIXED: URL-encode graph URI, inline implementation to avoid module issues.
     """
+    from urllib.parse import quote
+    import requests
+    
+    print("=" * 60)
+    print("  RDF SYNC - INLINE FIXED VERSION")
+    print("=" * 60)
+    
     try:
-        print("[sync_graph_to_rdf] Starting sync...")
-        
         fuseki = get_fuseki()
         neo4j = get_neo4j()
+        
+        # Config
+        fuseki_url = fuseki.config.url
+        dataset = fuseki.config.dataset
+        base_url = f"{fuseki_url}/{dataset}"
+        graph_uri = "http://graphweaver.io/graph/main"
+        auth = (fuseki.config.username, fuseki.config.password)
+        
+        print(f"[RDF] Fuseki URL: {fuseki_url}")
+        print(f"[RDF] Dataset: {dataset}")
+        print(f"[RDF] Graph URI: {graph_uri}")
+        
+        # Test connection
+        try:
+            resp = requests.get(f"{fuseki_url}/$/ping", timeout=5)
+            if resp.status_code != 200:
+                return f"ERROR: Fuseki not responding (status {resp.status_code})"
+            print("[RDF] ✓ Fuseki connected")
+        except Exception as e:
+            return f"ERROR: Cannot connect to Fuseki: {e}"
         
         # Ensure dataset exists
         fuseki.ensure_dataset_exists()
         
-        # Run sync
-        stats = sync_neo4j_to_rdf(neo4j, fuseki)
+        # Clear existing graph
+        clear_query = f"CLEAR GRAPH <{graph_uri}>"
+        requests.post(f"{base_url}/update", data={"update": clear_query}, auth=auth, timeout=30)
+        print("[RDF] ✓ Graph cleared")
         
-        print(f"[sync_graph_to_rdf] Done: {stats}")
+        # RDF Prefixes
+        PREFIXES = """
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix gw: <http://graphweaver.io/ontology#> .
+@prefix gwdata: <http://graphweaver.io/data#> .
+"""
         
-        if "error" in stats:
-            return f"ERROR: {stats['error']}"
+        def uri_safe(name):
+            return name.replace(" ", "_").replace("-", "_").replace(".", "_")
+        
+        def insert_turtle(turtle_content):
+            """Insert turtle with URL-encoded graph URI - THIS IS THE FIX."""
+            url = f"{base_url}/data?graph={quote(graph_uri, safe='')}"
+            print(f"[RDF] INSERT to: {url}")
+            print(f"[RDF] Content: {len(turtle_content)} bytes")
+            resp = requests.post(
+                url,
+                data=turtle_content.encode('utf-8'),
+                headers={"Content-Type": "text/turtle; charset=utf-8"},
+                auth=auth,
+                timeout=30
+            )
+            if resp.status_code in [200, 201, 204]:
+                print(f"[RDF] ✓ Insert OK: {resp.status_code}")
+                return True
+            else:
+                print(f"[RDF] ✗ Insert FAILED: {resp.status_code}")
+                print(f"[RDF] Response: {resp.text[:500]}")
+                return False
+        
+        stats = {"tables": 0, "columns": 0, "fks": 0, "jobs": 0, "datasets": 0}
+        
+        # Get tables from Neo4j
+        print("[RDF] Querying Neo4j for tables...")
+        tables_result = neo4j.run_query("""
+            MATCH (t:Table)
+            OPTIONAL MATCH (t)<-[:BELONGS_TO]-(c:Column)
+            WITH t, collect({name: c.name}) as columns
+            RETURN t.name as name, columns
+        """)
+        
+        if tables_result:
+            turtle_lines = [PREFIXES]
+            for table in tables_result:
+                table_name = table.get("name")
+                if not table_name:
+                    continue
+                table_uri = f"gwdata:table_{uri_safe(table_name)}"
+                turtle_lines.append(f'{table_uri} a gw:Table ; rdfs:label "{table_name}" .')
+                stats["tables"] += 1
+                
+                for col in table.get("columns", []):
+                    col_name = col.get("name")
+                    if col_name:
+                        col_uri = f"gwdata:column_{uri_safe(table_name)}_{uri_safe(col_name)}"
+                        turtle_lines.append(f'{col_uri} a gw:Column ; rdfs:label "{col_name}" ; gw:belongsToTable {table_uri} .')
+                        turtle_lines.append(f'{table_uri} gw:hasColumn {col_uri} .')
+                        stats["columns"] += 1
+            
+            print(f"[RDF] Found {stats['tables']} tables, {stats['columns']} columns")
+            if not insert_turtle("\n".join(turtle_lines)):
+                return "ERROR: Failed to insert tables"
+        else:
+            print("[RDF] WARNING: No tables found in Neo4j!")
+        
+        # Get FKs from Neo4j
+        print("[RDF] Querying Neo4j for FK relationships...")
+        fks_result = neo4j.run_query("""
+            MATCH (sc:Column)-[fk:FK_TO]->(tc:Column)
+            MATCH (sc)-[:BELONGS_TO]->(st:Table)
+            MATCH (tc)-[:BELONGS_TO]->(tt:Table)
+            RETURN st.name as source_table, sc.name as source_column,
+                   tt.name as target_table, tc.name as target_column
+        """)
+        
+        if fks_result:
+            turtle_lines = [PREFIXES]
+            for fk in fks_result:
+                src_col_uri = f"gwdata:column_{uri_safe(fk['source_table'])}_{uri_safe(fk['source_column'])}"
+                tgt_col_uri = f"gwdata:column_{uri_safe(fk['target_table'])}_{uri_safe(fk['target_column'])}"
+                turtle_lines.append(f'{src_col_uri} gw:references {tgt_col_uri} .')
+                stats["fks"] += 1
+            
+            print(f"[RDF] Found {stats['fks']} FK relationships")
+            insert_turtle("\n".join(turtle_lines))
+        
+        # Get Jobs from Neo4j
+        print("[RDF] Querying Neo4j for jobs...")
+        jobs_result = neo4j.run_query("""
+            MATCH (j:Job)
+            OPTIONAL MATCH (j)-[:READS]->(input:Dataset)
+            OPTIONAL MATCH (j)-[:WRITES]->(output:Dataset)
+            WITH j, collect(DISTINCT input.name) as inputs, collect(DISTINCT output.name) as outputs
+            RETURN j.name as name, inputs, outputs
+        """)
+        
+        if jobs_result:
+            turtle_lines = [PREFIXES]
+            dataset_names = set()
+            for job in jobs_result:
+                job_name = job.get("name")
+                if not job_name:
+                    continue
+                job_uri = f"gwdata:job_{uri_safe(job_name)}"
+                turtle_lines.append(f'{job_uri} a gw:Job ; rdfs:label "{job_name}" .')
+                stats["jobs"] += 1
+                
+                for ds_name in job.get("inputs", []):
+                    if ds_name:
+                        ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
+                        if ds_name not in dataset_names:
+                            turtle_lines.append(f'{ds_uri} a gw:Dataset ; rdfs:label "{ds_name}" .')
+                            dataset_names.add(ds_name)
+                        turtle_lines.append(f'{job_uri} gw:readsFrom {ds_uri} .')
+                
+                for ds_name in job.get("outputs", []):
+                    if ds_name:
+                        ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
+                        if ds_name not in dataset_names:
+                            turtle_lines.append(f'{ds_uri} a gw:Dataset ; rdfs:label "{ds_name}" .')
+                            dataset_names.add(ds_name)
+                        turtle_lines.append(f'{job_uri} gw:writesTo {ds_uri} .')
+            
+            stats["datasets"] = len(dataset_names)
+            print(f"[RDF] Found {stats['jobs']} jobs, {stats['datasets']} datasets")
+            insert_turtle("\n".join(turtle_lines))
+        
+        # Get triple count
+        count_query = f"SELECT (COUNT(*) as ?count) WHERE {{ GRAPH <{graph_uri}> {{ ?s ?p ?o }} }}"
+        count_resp = requests.post(
+            f"{base_url}/sparql",
+            data={"query": count_query},
+            headers={"Accept": "application/sparql-results+json"},
+            timeout=30
+        )
+        total_triples = 0
+        if count_resp.status_code == 200:
+            try:
+                bindings = count_resp.json().get("results", {}).get("bindings", [])
+                if bindings:
+                    total_triples = int(bindings[0].get("count", {}).get("value", 0))
+            except:
+                pass
+        
+        print(f"[RDF] Total triples in graph: {total_triples}")
+        print("=" * 60)
         
         output = "## RDF Sync Complete\n\n"
-        output += f"- Tables synced: {stats.get('tables', 0)}\n"
-        output += f"- Columns synced: {stats.get('columns', 0)}\n"
-        output += f"- Foreign keys synced: {stats.get('fks', 0)}\n"
-        output += f"- Jobs synced: {stats.get('jobs', 0)}\n"
-        output += f"- Datasets synced: {stats.get('datasets', 0)}\n"
-        output += f"- Dataset-table links: {stats.get('links', 0)}\n"
-        output += f"- **Total triples: {stats.get('total_triples', 0)}**\n"
+        output += f"- Tables synced: {stats['tables']}\n"
+        output += f"- Columns synced: {stats['columns']}\n"
+        output += f"- Foreign keys synced: {stats['fks']}\n"
+        output += f"- Jobs synced: {stats['jobs']}\n"
+        output += f"- Datasets synced: {stats['datasets']}\n"
+        output += f"- **Total triples: {total_triples}**\n"
         output += "\nYou can now query the RDF store with SPARQL or access it at http://localhost:3030"
         
         return output
@@ -2668,7 +2991,7 @@ def create_agent(verbose: bool = True):
         max_tokens=4096,
     )
     
-    agent = create_react_agent(llm, ALL_TOOLS, prompt=SYSTEM_PROMPT)
+    agent = create_react_agent(llm, ALL_TOOLS, state_modifier=SYSTEM_PROMPT)
     
     return agent
 

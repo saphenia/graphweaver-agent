@@ -1,4 +1,8 @@
-"""LTN (Logic Tensor Networks) module for learning and generating business rules."""
+"""LTN (Logic Tensor Networks) module for learning and generating business rules.
+
+FIXED: Lazy loading of TensorFlow/LTN to avoid conflicts with sentence-transformers.
+TensorFlow is only imported when LTN functionality is actually used.
+"""
 
 from .predicates import (
     LTNPredicateFactory,
@@ -21,6 +25,7 @@ from .knowledge_base import (
     LTNKnowledgeBase,
     Axiom,
     Constraint,
+    is_ltn_available,
 )
 from .trainer import (
     LTNTrainer,
@@ -46,4 +51,5 @@ __all__ = [
     "LTNTrainer",
     "TrainingConfig",
     "TrainingResult",
+    "is_ltn_available",
 ]
