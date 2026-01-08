@@ -13,8 +13,9 @@ This agent uses Claude to:
 The agent THINKS using Claude and makes decisions, not just runs a script.
 
 MODES:
-- Interactive (default): Chat with the agent
-- Streaming (--stream): Token-by-token streaming with Anthropic SDK
+- Interactive (default): Chat with the agent using new streaming API
+- SDK Streaming (--sdk): Token-by-token streaming with Anthropic SDK
+- Invoke (--invoke): Non-streaming invoke mode
 - Autonomous (--auto): Run full discovery autonomously
 
 FEATURES:
@@ -25,10 +26,13 @@ FEATURES:
 - RDF/SPARQL support (Apache Jena Fuseki)
 - LTN rule learning
 - Dynamic tool creation at runtime
+
+UPDATED: Migrated from deprecated create_react_agent (langgraph.prebuilt) 
+to new create_agent API (langchain.agents) with proper streaming support.
 """
 import os
 import sys
-from typing import Optional
+from typing import Optional, Any, TypedDict
 
 # Force unbuffered output for streaming mode
 os.environ['PYTHONUNBUFFERED'] = '1'
@@ -39,10 +43,22 @@ if hasattr(sys.stdout, 'reconfigure'):
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mcp_servers"))
 
-from langchain_core.tools import tool
+# =============================================================================
+# New LangChain Imports - Using create_agent instead of create_react_agent
+# =============================================================================
+from langchain.agents import create_agent, AgentState
+from langchain.agents.middleware import (
+    wrap_model_call, 
+    wrap_tool_call, 
+    before_model,
+    after_model,
+    ModelRequest, 
+    ModelResponse,
+    AgentMiddleware,
+)
+from langchain.tools import tool
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.prebuilt import create_react_agent
+from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 
 from graphweaver_agent import (
     DataSourceConfig, Neo4jConfig, PostgreSQLConnector,
@@ -269,11 +285,11 @@ def create_dynamic_tool(name: str, description: str, code: str) -> str:
     The function can accept keyword arguments.
     
     Example code:
-    ```python
+```python
     def run(table_name: str = "orders"):
         # Your tool logic here
         return f"Processed {table_name}"
-    ```
+```
     
     Args:
         name: Unique name for the tool (e.g., "generate_erd")
@@ -628,6 +644,7 @@ def run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5,
     except Exception as e:
         import traceback
         return f"ERROR in FK discovery: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+
         
 @tool  
 def discover_and_sync() -> str:
@@ -679,6 +696,8 @@ def discover_and_sync() -> str:
     except Exception as e:
         import traceback
         return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+
+
 @tool
 def analyze_potential_fk(source_table: str, source_column: str, 
                          target_table: str, target_column: str) -> str:
@@ -965,8 +984,6 @@ def connect_datasets_to_tables() -> str:
     except Exception as e:
         import traceback
         return f"ERROR connecting datasets to tables: {type(e).__name__}: {e}\n{traceback.format_exc()}"
-
-
 # =============================================================================
 # Tools - Embeddings & Semantic Search
 # =============================================================================
@@ -2830,7 +2847,7 @@ def show_ltn_knowledge_base() -> str:
 
 
 # =============================================================================
-# System Prompt (shared between LangChain and Streaming modes)
+# System Prompt (shared between all modes)
 # =============================================================================
 
 SYSTEM_PROMPT = """You are GraphWeaver Agent - an AI assistant that helps users discover foreign key relationships, execute business rules, capture data lineage, and perform semantic search on database metadata.
@@ -2968,7 +2985,7 @@ Be helpful and thorough!"""
 
 
 # =============================================================================
-# LangChain Agent Tools List
+# All Tools List
 # =============================================================================
 
 ALL_TOOLS = [
@@ -3031,6 +3048,7 @@ ALL_TOOLS = [
     # RDF Tools
     test_rdf_connection,
     sync_graph_to_rdf,
+    debug_rdf_sync,
     run_sparql,
     sparql_list_tables,
     sparql_get_foreign_keys,
@@ -3053,28 +3071,64 @@ ALL_TOOLS = [
 
 
 # =============================================================================
-# LangChain Agent Creation
+# Middleware for Error Handling (using NEW @wrap_tool_call decorator)
 # =============================================================================
 
-def create_agent(verbose: bool = True):
-    """Create the LangGraph agent with Claude."""
+@wrap_tool_call
+def handle_tool_errors(request, handler):
+    """Handle tool execution errors with custom messages."""
+    try:
+        return handler(request)
+    except Exception as e:
+        import traceback
+        error_msg = f"Tool error: {type(e).__name__}: {e}"
+        print(f"[TOOL ERROR] {error_msg}")
+        print(traceback.format_exc())
+        return ToolMessage(
+            content=error_msg,
+            tool_call_id=request.tool_call["id"]
+        )
+
+
+# =============================================================================
+# Agent Creation using NEW create_agent API
+# =============================================================================
+
+def create_graphweaver_agent(verbose: bool = True):
+    """Create the GraphWeaver agent using the NEW create_agent API.
+    
+    This replaces the deprecated create_react_agent from langgraph.prebuilt.
+    
+    Key differences from old API:
+    - Uses langchain.agents.create_agent instead of langgraph.prebuilt.create_react_agent
+    - System prompt is passed via system_prompt parameter (str or SystemMessage)
+    - Middleware replaces checkpointer for customization
+    - state_schema must be TypedDict (AgentState or subclass) if provided
+    """
     
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise ValueError("ANTHROPIC_API_KEY environment variable required")
     
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
+    # Create the model with configuration
+    model = ChatAnthropic(
+        model="claude-opus-4-5-20251101",
         temperature=0.1,
         max_tokens=4096,
     )
     
-    agent = create_react_agent(llm, ALL_TOOLS, state_modifier=SYSTEM_PROMPT)
+    # Create agent with NEW API
+    agent = create_agent(
+        model=model,
+        tools=ALL_TOOLS,
+        system_prompt=SYSTEM_PROMPT,
+        middleware=[handle_tool_errors],
+    )
     
     return agent
 
 
 def extract_response(result) -> str:
-    """Extract text response from LangGraph result."""
+    """Extract text response from agent result."""
     if not isinstance(result, dict):
         return str(result)
     
@@ -3082,14 +3136,12 @@ def extract_response(result) -> str:
     if not messages:
         return str(result)
     
-    # Get the last message
     last_msg = messages[-1]
     content = getattr(last_msg, 'content', None)
     
     if content is None:
         return str(last_msg)
     
-    # Content can be a string or a list of content blocks
     if isinstance(content, str):
         return content
     
@@ -3098,9 +3150,8 @@ def extract_response(result) -> str:
         for block in content:
             if isinstance(block, str):
                 text_parts.append(block)
-            elif isinstance(block, dict):
-                if block.get('type') == 'text':
-                    text_parts.append(block.get('text', ''))
+            elif isinstance(block, dict) and block.get('type') == 'text':
+                text_parts.append(block.get('text', ''))
             elif hasattr(block, 'text'):
                 text_parts.append(block.text)
         return '\n'.join(text_parts) if text_parts else str(content)
@@ -3108,14 +3159,19 @@ def extract_response(result) -> str:
     return str(content)
 
 
+# =============================================================================
+# Autonomous Discovery Mode
+# =============================================================================
+
 def run_autonomous_discovery(verbose: bool = True) -> dict:
     """Run fully autonomous FK discovery using Claude."""
     
     print("\n" + "="*60)
     print("  GraphWeaver Agent - Claude-Powered FK Discovery")
+    print("  (Using NEW create_agent API)")
     print("="*60 + "\n")
     
-    agent = create_agent(verbose=verbose)
+    agent = create_graphweaver_agent(verbose=verbose)
     
     instruction = """Discover all foreign key relationships in this database.
 
@@ -3129,7 +3185,7 @@ Work autonomously:
 Go!"""
     
     result = agent.invoke(
-        {"messages": [HumanMessage(content=instruction)]},
+        {"messages": [{"role": "user", "content": instruction}]},
         config={"recursion_limit": 100}
     )
     response = extract_response(result)
@@ -3142,14 +3198,21 @@ Go!"""
     return {"output": response}
 
 
-def run_interactive_langchain():
-    """Run agent in interactive mode using LangChain - chat with Claude."""
+# =============================================================================
+# Interactive Mode with NEW Streaming API
+# =============================================================================
+
+def run_interactive_with_streaming():
+    """Run agent in interactive mode with streaming using NEW create_agent API.
     
-    agent = create_agent(verbose=True)
+    Uses the .stream() method with stream_mode="values" for step-by-step output.
+    """
+    
+    agent = create_graphweaver_agent(verbose=True)
     history = []
     
     print("\n" + "="*60)
-    print("  GraphWeaver Agent - LangChain Mode")
+    print("  🕸️  GraphWeaver Agent - NEW API with Streaming")
     print("="*60)
     print("\nI can help you discover FK relationships in your database.")
     print("\nTry saying:")
@@ -3168,7 +3231,7 @@ def run_interactive_langchain():
     
     while True:
         try:
-            sys.stdout.write("You: ")
+            sys.stdout.write("\033[92mYou:\033[0m ")
             sys.stdout.flush()
             user_input = sys.stdin.readline()
             
@@ -3182,22 +3245,53 @@ def run_interactive_langchain():
             if user_input.lower() in ['quit', 'exit', 'q']:
                 break
             
-            print("\nThinking...", flush=True)
+            messages = history + [{"role": "user", "content": user_input}]
             
-            messages = history + [HumanMessage(content=user_input)]
-            
-            result = agent.invoke(
-                {"messages": messages},
-                config={"recursion_limit": 100}
-            )
-            
-            response_text = extract_response(result)
-            
-            print(f"\nAgent: {response_text}\n")
+            print("\n\033[96m🤖 Agent:\033[0m ", end="")
             sys.stdout.flush()
             
-            history.append(HumanMessage(content=user_input))
-            history.append(AIMessage(content=response_text))
+            # Stream response using NEW API
+            full_response = ""
+            tool_calls_seen = set()
+            
+            for chunk in agent.stream(
+                {"messages": messages},
+                stream_mode="values",
+                config={"recursion_limit": 100}
+            ):
+                if "messages" in chunk and chunk["messages"]:
+                    latest_message = chunk["messages"][-1]
+                    
+                    # Handle text content
+                    content = getattr(latest_message, 'content', '')
+                    if isinstance(content, str) and content:
+                        new_content = content[len(full_response):]
+                        if new_content:
+                            print(new_content, end="", flush=True)
+                            full_response = content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get('type') == 'text':
+                                text = block.get('text', '')
+                                new_content = text[len(full_response):]
+                                if new_content:
+                                    print(new_content, end="", flush=True)
+                                    full_response = text
+                    
+                    # Handle tool calls
+                    tool_calls = getattr(latest_message, 'tool_calls', None)
+                    if tool_calls:
+                        for tc in tool_calls:
+                            tc_id = tc.get('id', '')
+                            if tc_id and tc_id not in tool_calls_seen:
+                                tool_calls_seen.add(tc_id)
+                                print(f"\n\n🔧 **{tc.get('name', 'unknown')}**", flush=True)
+            
+            print("\n")
+            sys.stdout.flush()
+            
+            history.append({"role": "user", "content": user_input})
+            history.append({"role": "assistant", "content": full_response})
             
             if len(history) > 20:
                 history = history[-20:]
@@ -3213,14 +3307,78 @@ def run_interactive_langchain():
             print(f"\n[ERROR] {type(e).__name__}: {e}")
             traceback.print_exc()
     
+    print("\n👋 Goodbye!")
+
+
+# =============================================================================
+# Interactive Mode (Non-streaming using invoke)
+# =============================================================================
+
+def run_interactive_invoke():
+    """Run agent in interactive mode using invoke (non-streaming)."""
+    
+    agent = create_graphweaver_agent(verbose=True)
+    history = []
+    
+    print("\n" + "="*60)
+    print("  GraphWeaver Agent - Invoke Mode (non-streaming)")
+    print("="*60)
+    print("\nType 'quit' to exit.\n")
+    sys.stdout.flush()
+    
+    while True:
+        try:
+            sys.stdout.write("You: ")
+            sys.stdout.flush()
+            user_input = sys.stdin.readline()
+            
+            if not user_input:
+                break
+            
+            user_input = user_input.strip()
+            if not user_input:
+                continue
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                break
+            
+            print("\nThinking...", flush=True)
+            
+            messages = history + [{"role": "user", "content": user_input}]
+            
+            result = agent.invoke(
+                {"messages": messages},
+                config={"recursion_limit": 100}
+            )
+            
+            response_text = extract_response(result)
+            
+            print(f"\nAgent: {response_text}\n")
+            sys.stdout.flush()
+            
+            history.append({"role": "user", "content": user_input})
+            history.append({"role": "assistant", "content": response_text})
+            
+            if len(history) > 20:
+                history = history[-20:]
+                
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            print("\n")
+            break
+        except Exception as e:
+            import traceback
+            print(f"\n[ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
+    
     print("Goodbye!")
 
 
 # =============================================================================
-# Streaming Mode (Anthropic SDK)
+# Anthropic SDK Streaming Mode (Raw token streaming)
 # =============================================================================
 
-# Tool definitions for streaming mode (JSON schema format)
+# Tool definitions for streaming mode (JSON schema format for Anthropic SDK)
 STREAMING_TOOLS = [
     # Dynamic tool management
     {"name": "check_tool_exists", "description": "Check if a dynamic tool exists in the registry",
@@ -3253,6 +3411,8 @@ STREAMING_TOOLS = [
     # FK Discovery
     {"name": "run_fk_discovery", "description": "Run the full 5-stage FK discovery pipeline on the database",
      "input_schema": {"type": "object", "properties": {"min_match_rate": {"type": "number", "default": 0.95}, "min_score": {"type": "number", "default": 0.5}}}},
+    {"name": "discover_and_sync", "description": "One-stop shop: Discover FKs, build Neo4j graph, and sync to RDF",
+     "input_schema": {"type": "object", "properties": {}}},
     {"name": "analyze_potential_fk", "description": "Analyze a potential FK relationship and get a score",
      "input_schema": {"type": "object", "properties": {"source_table": {"type": "string"}, "source_column": {"type": "string"}, "target_table": {"type": "string"}, "target_column": {"type": "string"}}, "required": ["source_table", "source_column", "target_table", "target_column"]}},
     {"name": "validate_fk_with_data", "description": "Validate a FK by checking actual data integrity",
@@ -3325,6 +3485,8 @@ STREAMING_TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "sync_graph_to_rdf", "description": "Sync Neo4j graph to RDF/Fuseki",
      "input_schema": {"type": "object", "properties": {}}},
+    {"name": "debug_rdf_sync", "description": "Debug RDF sync step by step",
+     "input_schema": {"type": "object", "properties": {}}},
     {"name": "run_sparql", "description": "Execute a SPARQL query on Fuseki",
      "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
     {"name": "sparql_list_tables", "description": "List all tables in the RDF store",
@@ -3379,6 +3541,7 @@ STREAMING_TOOL_FUNCTIONS = {
     "get_column_stats": lambda **kw: get_column_stats.func(**kw),
     # FK Discovery
     "run_fk_discovery": lambda **kw: run_fk_discovery.func(**kw),
+    "discover_and_sync": lambda **kw: discover_and_sync.func(**kw),
     "analyze_potential_fk": lambda **kw: analyze_potential_fk.func(**kw),
     "validate_fk_with_data": lambda **kw: validate_fk_with_data.func(**kw),
     # Graph
@@ -3415,6 +3578,7 @@ STREAMING_TOOL_FUNCTIONS = {
     # RDF
     "test_rdf_connection": lambda **kw: test_rdf_connection.func(**kw),
     "sync_graph_to_rdf": lambda **kw: sync_graph_to_rdf.func(**kw),
+    "debug_rdf_sync": lambda **kw: debug_rdf_sync.func(**kw),
     "run_sparql": lambda **kw: run_sparql.func(**kw),
     "sparql_list_tables": lambda **kw: sparql_list_tables.func(**kw),
     "sparql_get_foreign_keys": lambda **kw: sparql_get_foreign_keys.func(**kw),
@@ -3449,7 +3613,7 @@ def stream_response(client, messages: list) -> tuple:
     current_block_id = None
 
     with client.messages.stream(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-5-20251101",
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=messages,
@@ -3479,11 +3643,11 @@ def stream_response(client, messages: list) -> tuple:
 
 
 def run_interactive_streaming():
-    """Run agent in interactive mode with token-by-token streaming."""
+    """Run agent in interactive mode with token-by-token streaming using Anthropic SDK."""
     import anthropic
     
     print("\n" + "=" * 60)
-    print("  🕸️  GraphWeaver Agent - Streaming Mode")
+    print("  🕸️  GraphWeaver Agent - Anthropic SDK Streaming Mode")
     print("=" * 60)
     print("\nI can help you discover FK relationships in your database.")
     print("Try saying:")
@@ -3564,35 +3728,51 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="GraphWeaver Agent - FK Discovery & Knowledge Graph",
+        description="GraphWeaver Agent - FK Discovery & Knowledge Graph (NEW API)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  (default)    Interactive chat using LangChain/LangGraph
-  --stream     Interactive chat with token-by-token streaming (Anthropic SDK)
+  (default)    Interactive chat using NEW create_agent API with streaming
+  --sdk        Interactive chat with Anthropic SDK streaming (raw tokens)
+  --invoke     Interactive chat using invoke (non-streaming)
   --auto       Run autonomous FK discovery then exit
 
+Migration Notes:
+  This version uses langchain.agents.create_agent instead of the 
+  deprecated langgraph.prebuilt.create_react_agent.
+  
+  Key changes:
+  - System prompt via system_prompt parameter (str or SystemMessage)
+  - Middleware for customization (@wrap_tool_call, @before_model, etc.)
+  - Custom state must be TypedDict extending AgentState
+  - Streaming via .stream(stream_mode="values")
+
 Examples:
-  python graphweaver_agent_complete.py              # LangChain interactive
-  python graphweaver_agent_complete.py --stream     # Streaming interactive
-  python graphweaver_agent_complete.py --auto       # Autonomous discovery
+  python graphweaver_agent_v2.py              # NEW API with streaming
+  python graphweaver_agent_v2.py --sdk        # Anthropic SDK streaming
+  python graphweaver_agent_v2.py --invoke     # Non-streaming invoke
+  python graphweaver_agent_v2.py --auto       # Autonomous discovery
         """
     )
     parser.add_argument("--auto", "-a", action="store_true", 
                        help="Run autonomous discovery then exit")
-    parser.add_argument("--stream", "-s", action="store_true",
-                       help="Use streaming mode (Anthropic SDK) for token-by-token output")
+    parser.add_argument("--sdk", "-s", action="store_true",
+                       help="Use Anthropic SDK streaming mode (raw tokens)")
+    parser.add_argument("--invoke", "-i", action="store_true",
+                       help="Use invoke mode (non-streaming)")
     parser.add_argument("--quiet", "-q", action="store_true", 
                        help="Less verbose output")
     args = parser.parse_args()
     
     if args.auto:
         run_autonomous_discovery(verbose=not args.quiet)
-    elif args.stream:
+    elif args.sdk:
         run_interactive_streaming()
+    elif args.invoke:
+        run_interactive_invoke()
     else:
-        # Default is LangChain interactive
-        run_interactive_langchain()
+        # Default: NEW API with streaming
+        run_interactive_with_streaming()
 
 
 if __name__ == "__main__":

@@ -377,19 +377,20 @@ class KGEmbedder:
             pass  # Already dropped or didn't exist
 
 
-def generate_all_kg_embeddings(neo4j_client) -> Dict[str, Any]:
+def generate_all_kg_embeddings(neo4j_client, embedding_dimension: int = 64) -> Dict[str, Any]:
     """
     Convenience function to generate KG embeddings for the entire graph.
     
-    FIXED: Better error handling and detailed status reporting.
+    FIXED: Better error handling and GUARANTEED cleanup with try/finally.
     
     Args:
         neo4j_client: Neo4j client instance
+        embedding_dimension: Size of embeddings (default 64, lower = less memory)
         
     Returns:
         Statistics dict with detailed status
     """
-    embedder = KGEmbedder(neo4j_client)
+    embedder = KGEmbedder(neo4j_client, embedding_dimension=embedding_dimension)
     
     # Check GDS availability
     gds_status = embedder.get_gds_status()
@@ -401,56 +402,61 @@ def generate_all_kg_embeddings(neo4j_client) -> Dict[str, Any]:
             "fix": gds_status.get("fix", "Install Neo4j GDS plugin"),
         }
     
-    # Create projection
-    print(f"[generate_all_kg_embeddings] Creating graph projection...")
-    projection_stats = embedder.create_graph_projection()
-    if "error" in projection_stats:
-        return {
-            "error": f"Failed to create graph projection: {projection_stats['error']}",
-            "gds_status": gds_status,
-        }
+    projection_stats = None
+    embedding_stats = None
     
-    # Check if we have enough nodes
-    if projection_stats.get("nodeCount", 0) < 2:
+    try:
+        # Create projection
+        print(f"[generate_all_kg_embeddings] Creating graph projection...")
+        projection_stats = embedder.create_graph_projection()
+        if "error" in projection_stats:
+            return {
+                "error": f"Failed to create graph projection: {projection_stats['error']}",
+                "gds_status": gds_status,
+            }
+        
+        # Check if we have enough nodes
+        if projection_stats.get("nodeCount", 0) < 2:
+            return {
+                "error": "Not enough nodes for embedding generation (need at least 2)",
+                "projection": projection_stats,
+            }
+        
+        # Check if we have any relationships
+        if projection_stats.get("relationshipCount", 0) == 0:
+            return {
+                "error": "No relationships found. Run FK discovery first to create relationships.",
+                "projection": projection_stats,
+            }
+        
+        # Generate embeddings
+        print(f"[generate_all_kg_embeddings] Generating FastRP embeddings (dim={embedding_dimension})...")
+        embedding_stats = embedder.generate_fastrp_embeddings()
+        
+        if "error" in embedding_stats:
+            return {
+                "error": f"Failed to generate embeddings: {embedding_stats['error']}",
+                "projection": projection_stats,
+            }
+        
+        # Get final stats
+        final_stats = embedder.get_embedding_stats()
+        
+        result = {
+            "success": True,
+            "projection": projection_stats,
+            "embeddings": embedding_stats,
+            "coverage": final_stats,
+        }
+        
+        print(f"[generate_all_kg_embeddings] Complete: {result}")
+        return result
+        
+    finally:
+        # ALWAYS clean up the graph projection to free memory
+        print(f"[generate_all_kg_embeddings] Cleaning up graph projection...")
         embedder.drop_graph_projection()
-        return {
-            "error": "Not enough nodes for embedding generation (need at least 2)",
-            "projection": projection_stats,
-        }
-    
-    # Check if we have any relationships
-    if projection_stats.get("relationshipCount", 0) == 0:
-        embedder.drop_graph_projection()
-        return {
-            "error": "No relationships found. Run FK discovery first to create relationships.",
-            "projection": projection_stats,
-        }
-    
-    # Generate embeddings
-    print(f"[generate_all_kg_embeddings] Generating FastRP embeddings...")
-    embedding_stats = embedder.generate_fastrp_embeddings()
-    
-    # Clean up
-    embedder.drop_graph_projection()
-    
-    if "error" in embedding_stats:
-        return {
-            "error": f"Failed to generate embeddings: {embedding_stats['error']}",
-            "projection": projection_stats,
-        }
-    
-    # Get final stats
-    final_stats = embedder.get_embedding_stats()
-    
-    result = {
-        "success": True,
-        "projection": projection_stats,
-        "embeddings": embedding_stats,
-        "coverage": final_stats,
-    }
-    
-    print(f"[generate_all_kg_embeddings] Complete: {result}")
-    return result
+        print(f"[generate_all_kg_embeddings] Cleanup complete")
 
 
 def verify_kg_embeddings(neo4j_client) -> Dict[str, Any]:

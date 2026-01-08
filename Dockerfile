@@ -7,18 +7,18 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 curl build-essential && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Install uv directly (no ghcr.io)
+RUN pip install uv
 
-# LAYER 1: Dependencies (cached via uv)
+# LAYER 1: Dependencies
 COPY pyproject.toml uv.lock* README.md ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync && uv pip install streamlit
+RUN uv sync && uv pip install streamlit tf-keras langchain
 
-# LAYER 2: Bake ML model INTO image (no cache mount = persists in layer)
+# LAYER 2: Bake ML model INTO image
 ENV HF_HOME=/app/.cache/huggingface
 RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
-# LAYER 3: Source code only (fast rebuild)
+# LAYER 3: Source code only
 COPY src/ ./src/
 COPY mcp_servers/ ./mcp_servers/
 COPY agent.py streamlit_app.py business_rules.yaml debug_logger.py ./

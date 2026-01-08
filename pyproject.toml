@@ -12,6 +12,7 @@ dependencies = [
     "neo4j>=5.0.0",
     # LangChain + Claude
     "langchain-anthropic>=0.3.10",
+    "langchain>=1.2.0",              # <-- ADD THIS LINE
     "langchain-core>=0.3.30",
     "langgraph>=0.2.60",
     # MCP
