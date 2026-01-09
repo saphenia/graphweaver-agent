@@ -91,7 +91,6 @@ from graphweaver_agent.dynamic_tools.agent_tools import (
 from conversation_memory import get_memory, Conversation
 from conversation_sidebar import (
     render_conversation_sidebar,
-    render_conversation_actions,
     add_message,
     get_current_streaming_messages,
 )
@@ -2131,7 +2130,6 @@ def main():
         # NEW: CONVERSATION HISTORY SECTION
         # =============================================
         render_conversation_sidebar()
-        render_conversation_actions()
         
         st.divider()
         

@@ -21,7 +21,7 @@ RUN uv run python -c "from sentence_transformers import SentenceTransformer; Sen
 # LAYER 3: Source code only
 COPY src/ ./src/
 COPY mcp_servers/ ./mcp_servers/
-COPY agent.py streamlit_app.py business_rules.yaml debug_logger.py ./
+COPY agent.py streamlit_app.py conversation_memory.py conversation_sidebar.py business_rules.yaml debug_logger.py ./
 
 ENV PYTHONUNBUFFERED=1 PATH="/app/.venv/bin:$PATH"
 
