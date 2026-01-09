@@ -54,9 +54,12 @@ def stream_agent_response(agent, user_message: str, chat_history: List[Dict], me
     debug.agent(f"User message: {user_message[:100]}...")
     debug.agent(f"History length: {len(chat_history)}")
     
+    # Config with higher recursion limit for complex multi-step operations
+    config = {"recursion_limit": 100}
+    
     try:
         # Stream events from LangGraph agent
-        for event in agent.stream({"messages": messages}):
+        for event in agent.stream({"messages": messages}, config=config):
             
             # Handle agent output (text and tool calls)
             if "agent" in event:
