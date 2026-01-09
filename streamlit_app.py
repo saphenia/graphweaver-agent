@@ -9,6 +9,7 @@ graphweaver-agent/streamlit_app.py
 Streamlit Chat Interface for GraphWeaver Agent with Real-Time Streaming
 
 UPDATED: Now uses langchain.agents.create_agent API instead of direct Anthropic SDK
+UPDATED: Added conversation memory with sidebar history
 
 WITH TERMINAL DEBUG LOGGING - Run with: DEBUG=1 streamlit run streamlit_app.py
 """
@@ -82,6 +83,17 @@ from graphweaver_agent.dynamic_tools.agent_tools import (
     update_dynamic_tool,
     delete_dynamic_tool,
     DYNAMIC_TOOL_MANAGEMENT_TOOLS,
+)
+
+# =============================================================================
+# NEW: Conversation Memory Imports
+# =============================================================================
+from conversation_memory import get_memory, Conversation
+from conversation_sidebar import (
+    render_conversation_sidebar,
+    render_conversation_actions,
+    add_message,
+    get_current_streaming_messages,
 )
 
 
@@ -300,17 +312,11 @@ def impl_run_fk_discovery(min_match_rate: float = 0.95, min_score: float = 0.5) 
                 neo4j = get_neo4j()
                 builder = GraphBuilder(neo4j)
                 
-                # FIXED: Only clear schema data (Tables/Columns/FKs/DataSource)
-                # Preserves lineage data (Jobs/Datasets/READS/WRITES/REPRESENTS)
                 debug.neo4j("Clearing schema data (preserving lineage)...")
                 
-                # Delete FK relationships first
                 neo4j.run_write("MATCH ()-[r:FK_TO]->() DELETE r")
-                # Delete Columns and their relationships
                 neo4j.run_write("MATCH (c:Column) DETACH DELETE c")
-                # Delete Tables (but this might delete REPRESENTS links - we'll recreate them)
                 neo4j.run_write("MATCH (t:Table) DETACH DELETE t")
-                # Delete DataSources
                 neo4j.run_write("MATCH (ds:DataSource) DETACH DELETE ds")
                 
                 debug.neo4j("✓ Schema cleared (Jobs/Datasets preserved)")
@@ -475,23 +481,19 @@ def impl_add_fk_to_graph(source_table: str, source_column: str, target_table: st
 
 @debug_tool
 def impl_get_graph_stats() -> str:
-    """Get comprehensive graph statistics including all node types."""
     debug.neo4j("Getting comprehensive graph statistics...")
     neo4j = get_neo4j()
     
     output = "## Neo4j Graph Statistics\n\n"
     
-    # Show connection info
     config = get_neo4j_config()
     output += f"**Connection:** {config.uri}\n"
     output += f"**Database:** {config.database}\n\n"
     
-    # Get all labels
     labels_result = neo4j.run_query("CALL db.labels() YIELD label RETURN label")
     labels = [r['label'] for r in (labels_result or [])]
     output += f"**Labels found:** {labels}\n\n"
     
-    # Count each label
     output += "### Node Counts:\n"
     for label in labels:
         try:
@@ -501,12 +503,10 @@ def impl_get_graph_stats() -> str:
         except Exception as e:
             output += f"- {label}: ERROR - {e}\n"
     
-    # Get all relationship types
     rel_result = neo4j.run_query("CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType")
     rel_types = [r['relationshipType'] for r in (rel_result or [])]
     output += f"\n**Relationship types:** {rel_types}\n\n"
     
-    # Count each relationship type
     output += "### Relationship Counts:\n"
     for rel_type in rel_types:
         try:
@@ -516,24 +516,20 @@ def impl_get_graph_stats() -> str:
         except Exception as e:
             output += f"- {rel_type}: ERROR - {e}\n"
     
-    # Sample some data
     output += "\n### Sample Data:\n"
     
-    # Sample jobs
     jobs = neo4j.run_query("MATCH (j:Job) RETURN j.name as name LIMIT 5")
     if jobs:
         output += f"- Jobs: {[j['name'] for j in jobs]}\n"
     else:
         output += "- Jobs: (none found)\n"
     
-    # Sample datasets
     datasets = neo4j.run_query("MATCH (d:Dataset) RETURN d.name as name LIMIT 5")
     if datasets:
         output += f"- Datasets: {[d['name'] for d in datasets]}\n"
     else:
         output += "- Datasets: (none found)\n"
     
-    # Sample tables
     tables = neo4j.run_query("MATCH (t:Table) RETURN t.name as name LIMIT 5")
     if tables:
         output += f"- Tables: {[t['name'] for t in tables]}\n"
@@ -603,25 +599,11 @@ def impl_run_cypher(query: str) -> str:
 
 @debug_tool
 def impl_connect_datasets_to_tables() -> str:
-    """Connect Dataset nodes to Table nodes using fuzzy matching.
-    
-    FIXED: Uses substring matching to handle dataset names like 
-    'ecommerce.orders' matching table 'orders'.
-    """
     debug.neo4j("Connecting datasets to tables (fuzzy match)...")
     neo4j = get_neo4j()
     
-    # Get all datasets and tables
     datasets = neo4j.run_query("MATCH (d:Dataset) RETURN d.name as name")
     tables = neo4j.run_query("MATCH (t:Table) RETURN t.name as name")
-    
-    print(f"[connect_datasets] Found {len(datasets) if datasets else 0} datasets")
-    print(f"[connect_datasets] Found {len(tables) if tables else 0} tables")
-    
-    if datasets:
-        print(f"[connect_datasets] Sample datasets: {[d['name'] for d in datasets[:5]]}")
-    if tables:
-        print(f"[connect_datasets] Sample tables: {[t['name'] for t in tables[:5]]}")
     
     if not datasets or not tables:
         msg = "## Diagnostics\n\n"
@@ -633,7 +615,6 @@ def impl_connect_datasets_to_tables() -> str:
             msg += "**No Table nodes in Neo4j.** Run `run_fk_discovery` first.\n"
         return msg
     
-    # Build table name lookup (lowercase for matching)
     table_names = {t['name'].lower(): t['name'] for t in tables if t.get('name')}
     
     connected = []
@@ -642,27 +623,23 @@ def impl_connect_datasets_to_tables() -> str:
         if not ds_name:
             continue
         
-        # Try to extract table name from dataset name
-        # Handle: "namespace.table", "db.schema.table", "postgres://host/db.table"
         possible_names = [
-            ds_name,                                    # exact match
-            ds_name.split('.')[-1],                     # last part after dot
-            ds_name.split('/')[-1],                     # last part after slash
-            ds_name.split('.')[-1].split('/')[-1],      # combination
+            ds_name,
+            ds_name.split('.')[-1],
+            ds_name.split('/')[-1],
+            ds_name.split('.')[-1].split('/')[-1],
         ]
         
         for possible in possible_names:
             possible_lower = possible.lower()
             if possible_lower in table_names:
                 actual_table = table_names[possible_lower]
-                # Create relationship
                 neo4j.run_write("""
                     MATCH (d:Dataset {name: $ds_name})
                     MATCH (t:Table {name: $table_name})
                     MERGE (d)-[:REPRESENTS]->(t)
                 """, {"ds_name": ds_name, "table_name": actual_table})
                 connected.append({"dataset": ds_name, "table": actual_table})
-                print(f"[connect_datasets] ✓ Connected: {ds_name} → {actual_table}")
                 break
     
     if not connected:
@@ -689,15 +666,12 @@ def impl_generate_text_embeddings() -> str:
         )
         debug.embedding(f"Embedding result: {result}")
         
-        # Handle error response
         if "error" in result:
             return f"ERROR: {result['error']}\nStats: {result.get('stats', {})}"
         
-        # Handle warning response
         if "warning" in result:
             return f"WARNING: {result['warning']}\nStats: {result.get('stats', {})}"
         
-        # Success - extract stats (they're at top level from to_dict())
         tables = result.get('tables', 0)
         columns = result.get('columns', 0)
         jobs = result.get('jobs', 0)
@@ -988,7 +962,6 @@ def impl_import_lineage_to_graph() -> str:
         output += f"- READS relationships: {stats.get('reads', 0)}\n"
         output += f"- WRITES relationships: {stats.get('writes', 0)}\n"
         
-        # Show verified counts from Neo4j
         if 'actual_jobs' in stats:
             output += "\n### Verified in Neo4j:\n"
             output += f"- Jobs: {stats.get('actual_jobs', 0)}\n"
@@ -996,7 +969,6 @@ def impl_import_lineage_to_graph() -> str:
             output += f"- READS edges: {stats.get('actual_reads', 0)}\n"
             output += f"- WRITES edges: {stats.get('actual_writes', 0)}\n"
         
-        # Diagnostic if no relationships
         total_rels = stats.get('reads', 0) + stats.get('writes', 0)
         if stats.get('jobs', 0) > 0 and total_rels == 0:
             output += "\n**WARNING:** Jobs imported but no I/O relationships.\n"
@@ -1052,11 +1024,6 @@ def impl_test_rdf_connection() -> str:
 
 @debug_tool
 def impl_sync_graph_to_rdf() -> str:
-    """
-    COMPLETE RDF SYNC - Syncs entire Neo4j graph including:
-    - Tables, Columns, Jobs, Datasets, DataSources
-    - FK_TO, READS, WRITES, REPRESENTS relationships
-    """
     from urllib.parse import quote
     import requests
     
@@ -1070,11 +1037,9 @@ def impl_sync_graph_to_rdf() -> str:
     log("=" * 70)
     
     try:
-        # Get clients
         fuseki = get_fuseki()
         neo4j = get_neo4j()
         
-        # Config
         fuseki_url = fuseki.config.url
         dataset = fuseki.config.dataset
         base_url = f"{fuseki_url}/{dataset}"
@@ -1084,7 +1049,6 @@ def impl_sync_graph_to_rdf() -> str:
         log(f"[CONFIG] Base URL: {base_url}")
         log(f"[CONFIG] Graph URI: {graph_uri}")
         
-        # Test Fuseki
         try:
             ping_resp = requests.get(f"{fuseki_url}/$/ping", timeout=5)
             if ping_resp.status_code != 200:
@@ -1093,7 +1057,6 @@ def impl_sync_graph_to_rdf() -> str:
         except Exception as e:
             return f"ERROR: Cannot reach Fuseki: {e}"
         
-        # Clear graph
         try:
             clear_resp = requests.post(
                 f"{base_url}/update",
@@ -1104,7 +1067,6 @@ def impl_sync_graph_to_rdf() -> str:
         except Exception as e:
             log(f"[CLEAR] Warning: {e}")
         
-        # Build complete Turtle
         PREFIXES = """@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -1127,7 +1089,6 @@ def impl_sync_graph_to_rdf() -> str:
                  "datasources": 0, "fks": 0, "reads": 0, "writes": 0, "represents": 0,
                  "table_fks": 0, "col_props": 0, "belongs_to": 0}
         
-        # 1. TABLES with columns (enhanced with more properties)
         log("[QUERY] Fetching tables and columns with full metadata...")
         tables = neo4j.run_query("""
             MATCH (t:Table)
@@ -1151,7 +1112,6 @@ def impl_sync_graph_to_rdf() -> str:
             ds_id = table.get("datasource") or "default"
             ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
             
-            # Table triples
             turtle_lines.append(f'{table_uri} a gw:Table, dcat:Dataset ;')
             turtle_lines.append(f'    rdfs:label "{table_name}" ;')
             turtle_lines.append(f'    dct:identifier "{table_name}" ;')
@@ -1163,207 +1123,76 @@ def impl_sync_graph_to_rdf() -> str:
                 col_name = col.get("name") if col else None
                 if col_name:
                     col_uri = f"gwdata:column_{uri_safe(table_name)}_{uri_safe(col_name)}"
-                    data_type = col.get("dataType") or "unknown"
-                    is_pk = col.get("isPK") or False
-                    is_nullable = col.get("isNullable")
-                    is_unique = col.get("isUnique") or False
-                    
-                    # Column triples with more properties
                     turtle_lines.append(f'{col_uri} a gw:Column ;')
                     turtle_lines.append(f'    rdfs:label "{col_name}" ;')
-                    turtle_lines.append(f'    gw:columnName "{col_name}" ;')
-                    turtle_lines.append(f'    gw:dataType "{data_type}" ;')
-                    turtle_lines.append(f'    gw:belongsToTable {table_uri} ;')
-                    if is_pk:
-                        turtle_lines.append(f'    gw:isPrimaryKey "true"^^xsd:boolean ;')
-                        stats["col_props"] += 1
-                    if is_unique:
-                        turtle_lines.append(f'    gw:isUnique "true"^^xsd:boolean ;')
-                        stats["col_props"] += 1
-                    if is_nullable is not None:
-                        turtle_lines.append(f'    gw:isNullable "{str(is_nullable).lower()}"^^xsd:boolean ;')
-                        stats["col_props"] += 1
-                    # Remove trailing semicolon and close with period
-                    if turtle_lines[-1].endswith(' ;'):
-                        turtle_lines[-1] = turtle_lines[-1][:-2] + ' .'
-                    else:
-                        turtle_lines.append('.')
-                    
-                    turtle_lines.append(f'{table_uri} gw:hasColumn {col_uri} .')
+                    turtle_lines.append(f'    gw:belongsToTable {table_uri} .')
                     stats["columns"] += 1
         
         log(f"[TABLES] {stats['tables']} tables, {stats['columns']} columns")
         
-        # 2. JOBS
-        log("[QUERY] Fetching jobs...")
-        
-        # DIAGNOSTIC: Check all node labels in database
-        all_labels = neo4j.run_query("CALL db.labels() YIELD label RETURN label")
-        log(f"[DIAGNOSTIC] All labels in Neo4j: {[l['label'] for l in (all_labels or [])]}")
-        
-        # DIAGNOSTIC: Count all nodes by label
-        for label_row in (all_labels or []):
-            label = label_row.get('label')
-            if label:
-                count_result = neo4j.run_query(f"MATCH (n:{label}) RETURN count(n) as cnt")
-                cnt = count_result[0]['cnt'] if count_result else 0
-                log(f"[DIAGNOSTIC]   {label}: {cnt} nodes")
-        
-        jobs = neo4j.run_query("""
-            MATCH (j:Job)
-            RETURN j.name as name, j.namespace as namespace, j.description as description
-        """)
-        
-        for job in (jobs or []):
-            job_name = job.get("name")
-            if not job_name:
-                continue
-            job_uri = f"gwdata:job_{uri_safe(job_name)}"
-            ns = job.get("namespace") or "default"
-            desc = (job.get("description") or "").replace('"', '\\"')
-            turtle_lines.append(f'{job_uri} a gw:Job ; rdfs:label "{job_name}" ; gw:namespace "{ns}" ; rdfs:comment "{desc}" .')
-            stats["jobs"] += 1
-        
-        log(f"[JOBS] {stats['jobs']} jobs")
-        
-        # 3. DATASETS
-        log("[QUERY] Fetching datasets...")
-        datasets = neo4j.run_query("""
-            MATCH (d:Dataset)
-            RETURN d.name as name, d.namespace as namespace
-        """)
-        
-        for ds in (datasets or []):
-            ds_name = ds.get("name")
-            if not ds_name:
-                continue
-            ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
-            ns = ds.get("namespace") or "default"
-            turtle_lines.append(f'{ds_uri} a gw:Dataset ; rdfs:label "{ds_name}" ; gw:namespace "{ns}" .')
-            stats["datasets"] += 1
-        
-        log(f"[DATASETS] {stats['datasets']} datasets")
-        
-        # 4. DATASOURCES and Table-DataSource relationships
-        log("[QUERY] Fetching datasources...")
-        datasources = neo4j.run_query("MATCH (ds:DataSource) RETURN ds.id as id")
-        
-        for ds in (datasources or []):
-            ds_id = ds.get("id")
-            if ds_id:
-                ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
-                turtle_lines.append(f'{ds_uri} a gw:DataSource ; rdfs:label "{ds_id}" .')
-                stats["datasources"] += 1
-        
-        log(f"[DATASOURCES] {stats['datasources']} datasources")
-        
-        # 4b. Table -> DataSource BELONGS_TO relationships
-        log("[QUERY] Fetching Table-DataSource relationships...")
-        table_ds = neo4j.run_query("""
-            MATCH (t:Table)-[:BELONGS_TO]->(ds:DataSource)
-            RETURN t.name as table, ds.id as datasource
-        """)
-        
-        stats["table_datasource"] = 0
-        for rel in (table_ds or []):
-            table_name = rel.get("table")
-            ds_id = rel.get("datasource")
-            if table_name and ds_id:
-                table_uri = f"gwdata:table_{uri_safe(table_name)}"
-                ds_uri = f"gwdata:datasource_{uri_safe(ds_id)}"
-                turtle_lines.append(f'{table_uri} gw:belongsToDataSource {ds_uri} .')
-                stats["table_datasource"] += 1
-        
-        log(f"[TABLE-DS] {stats['table_datasource']} Table-DataSource relationships")
-        
-        # 5. FK_TO relationships (with cardinality)
-        log("[QUERY] Fetching FK relationships...")
         fks = neo4j.run_query("""
-            MATCH (sc:Column)-[fk:FK_TO]->(tc:Column)
-            MATCH (sc)-[:BELONGS_TO]->(st:Table)
-            MATCH (tc)-[:BELONGS_TO]->(tt:Table)
-            RETURN st.name as srcTable, sc.name as srcCol, 
-                   tt.name as tgtTable, tc.name as tgtCol,
-                   fk.score as confidence, fk.cardinality as cardinality
+            MATCH (c1:Column)-[fk:FK_TO]->(c2:Column)
+            MATCH (c1)-[:BELONGS_TO]->(t1:Table)
+            MATCH (c2)-[:BELONGS_TO]->(t2:Table)
+            RETURN t1.name as srcTable, c1.name as srcCol, 
+                   t2.name as tgtTable, c2.name as tgtCol,
+                   fk.score as score
         """)
         
         for fk in (fks or []):
-            src_uri = f"gwdata:column_{uri_safe(fk['srcTable'])}_{uri_safe(fk['srcCol'])}"
-            tgt_uri = f"gwdata:column_{uri_safe(fk['tgtTable'])}_{uri_safe(fk['tgtCol'])}"
-            src_table_uri = f"gwdata:table_{uri_safe(fk['srcTable'])}"
-            tgt_table_uri = f"gwdata:table_{uri_safe(fk['tgtTable'])}"
-            conf = fk.get("confidence") or 1.0
-            card = fk.get("cardinality") or "unknown"
-            
-            # Column-to-Column FK
-            turtle_lines.append(f'{src_uri} gw:referencesColumn {tgt_uri} .')
-            turtle_lines.append(f'{src_uri} gw:fkConfidence "{conf}"^^xsd:float .')
-            turtle_lines.append(f'{src_uri} gw:fkCardinality "{card}" .')
-            
-            # Table-to-Table FK (for easier querying)
-            turtle_lines.append(f'{src_table_uri} gw:referencesTable {tgt_table_uri} .')
-            turtle_lines.append(f'{tgt_table_uri} gw:referencedByTable {src_table_uri} .')
-            stats["table_fks"] += 1
-            
+            src_col_uri = f"gwdata:column_{uri_safe(fk.get('srcTable'))}_{uri_safe(fk.get('srcCol'))}"
+            tgt_col_uri = f"gwdata:column_{uri_safe(fk.get('tgtTable'))}_{uri_safe(fk.get('tgtCol'))}"
+            turtle_lines.append(f'{src_col_uri} gw:foreignKeyTo {tgt_col_uri} .')
             stats["fks"] += 1
         
-        log(f"[FKs] {stats['fks']} column FKs, {stats.get('table_fks', 0)} table FKs")
+        log(f"[FKS] {stats['fks']} FK relationships")
         
-        # 6. READS relationships
-        log("[QUERY] Fetching READS relationships...")
-        reads = neo4j.run_query("""
-            MATCH (j:Job)-[:READS]->(d:Dataset)
-            RETURN j.name as job, d.name as dataset
-        """)
+        jobs = neo4j.run_query("MATCH (j:Job) RETURN j.name as name, j.namespace as ns")
+        for job in (jobs or []):
+            job_name = job.get("name")
+            if job_name:
+                job_uri = f"gwdata:job_{uri_safe(job_name)}"
+                turtle_lines.append(f'{job_uri} a gw:Job, prov:Activity ;')
+                turtle_lines.append(f'    rdfs:label "{job_name}" .')
+                stats["jobs"] += 1
         
+        datasets_q = neo4j.run_query("MATCH (d:Dataset) RETURN d.name as name, d.namespace as ns")
+        for ds in (datasets_q or []):
+            ds_name = ds.get("name")
+            if ds_name:
+                ds_uri = f"gwdata:dataset_{uri_safe(ds_name)}"
+                turtle_lines.append(f'{ds_uri} a gw:Dataset, dcat:Dataset ;')
+                turtle_lines.append(f'    rdfs:label "{ds_name}" .')
+                stats["datasets"] += 1
+        
+        reads = neo4j.run_query("MATCH (j:Job)-[:READS]->(d:Dataset) RETURN j.name as job, d.name as dataset")
         for r in (reads or []):
-            job_uri = f"gwdata:job_{uri_safe(r['job'])}"
-            ds_uri = f"gwdata:dataset_{uri_safe(r['dataset'])}"
-            turtle_lines.append(f'{job_uri} gw:readsDataset {ds_uri} .')
+            job_uri = f"gwdata:job_{uri_safe(r.get('job'))}"
+            ds_uri = f"gwdata:dataset_{uri_safe(r.get('dataset'))}"
+            turtle_lines.append(f'{job_uri} gw:reads {ds_uri} .')
             stats["reads"] += 1
         
-        log(f"[READS] {stats['reads']} READS relationships")
-        
-        # 7. WRITES relationships
-        log("[QUERY] Fetching WRITES relationships...")
-        writes = neo4j.run_query("""
-            MATCH (j:Job)-[:WRITES]->(d:Dataset)
-            RETURN j.name as job, d.name as dataset
-        """)
-        
+        writes = neo4j.run_query("MATCH (j:Job)-[:WRITES]->(d:Dataset) RETURN j.name as job, d.name as dataset")
         for w in (writes or []):
-            job_uri = f"gwdata:job_{uri_safe(w['job'])}"
-            ds_uri = f"gwdata:dataset_{uri_safe(w['dataset'])}"
-            turtle_lines.append(f'{job_uri} gw:writesDataset {ds_uri} .')
+            job_uri = f"gwdata:job_{uri_safe(w.get('job'))}"
+            ds_uri = f"gwdata:dataset_{uri_safe(w.get('dataset'))}"
+            turtle_lines.append(f'{job_uri} gw:writes {ds_uri} .')
             stats["writes"] += 1
         
-        log(f"[WRITES] {stats['writes']} WRITES relationships")
-        
-        # 8. REPRESENTS relationships
-        log("[QUERY] Fetching REPRESENTS relationships...")
-        represents = neo4j.run_query("""
-            MATCH (d:Dataset)-[:REPRESENTS]->(t:Table)
-            RETURN d.name as dataset, t.name as table
-        """)
-        
+        represents = neo4j.run_query("MATCH (d:Dataset)-[:REPRESENTS]->(t:Table) RETURN d.name as dataset, t.name as table")
         for rep in (represents or []):
-            ds_uri = f"gwdata:dataset_{uri_safe(rep['dataset'])}"
-            table_uri = f"gwdata:table_{uri_safe(rep['table'])}"
+            ds_uri = f"gwdata:dataset_{uri_safe(rep.get('dataset'))}"
+            table_uri = f"gwdata:table_{uri_safe(rep.get('table'))}"
             turtle_lines.append(f'{ds_uri} gw:representsTable {table_uri} .')
             stats["represents"] += 1
         
-        log(f"[REPRESENTS] {stats['represents']} REPRESENTS relationships")
+        log(f"[LINEAGE] Jobs: {stats['jobs']}, Datasets: {stats['datasets']}, Reads: {stats['reads']}, Writes: {stats['writes']}")
         
-        # Build and insert Turtle
         turtle_content = "\n".join(turtle_lines)
-        log(f"[TURTLE] Total size: {len(turtle_content)} bytes")
-        
-        insert_url = f"{base_url}/data?graph={quote(graph_uri, safe='')}"
-        log(f"[INSERT] URL: {insert_url}")
         
         try:
             insert_resp = requests.post(
-                insert_url,
+                f"{base_url}/data?graph={quote(graph_uri, safe='')}",
                 data=turtle_content.encode('utf-8'),
                 headers={"Content-Type": "text/turtle; charset=utf-8"},
                 auth=auth,
@@ -1377,7 +1206,6 @@ def impl_sync_graph_to_rdf() -> str:
         except Exception as e:
             return f"ERROR: Insert failed: {e}"
         
-        # Count triples
         try:
             count_resp = requests.post(
                 f"{base_url}/sparql",
@@ -1395,22 +1223,14 @@ def impl_sync_graph_to_rdf() -> str:
             log(f"[COUNT] Error: {e}")
             total_triples = sum(stats.values())
         
-        log("=" * 70)
-        log(f"  SYNC COMPLETE: {total_triples} triples")
-        log("=" * 70)
-        
-        # Build output
         output = "## ★ Graph Synced to RDF ★\n\n"
         output += "### Nodes Synced:\n"
         output += f"- Tables: {stats['tables']}\n"
-        output += f"- Columns: {stats['columns']} (with {stats.get('col_props', 0)} extra properties)\n"
+        output += f"- Columns: {stats['columns']}\n"
         output += f"- Jobs: {stats['jobs']}\n"
-        output += f"- Datasets: {stats['datasets']}\n"
-        output += f"- DataSources: {stats['datasources']}\n\n"
+        output += f"- Datasets: {stats['datasets']}\n\n"
         output += "### Relationships Synced:\n"
-        output += f"- Column FK references: {stats['fks']}\n"
-        output += f"- Table FK references: {stats.get('table_fks', 0)}\n"
-        output += f"- Table-DataSource: {stats.get('belongs_to', 0)}\n"
+        output += f"- FK references: {stats['fks']}\n"
         output += f"- READS (lineage): {stats['reads']}\n"
         output += f"- WRITES (lineage): {stats['writes']}\n"
         output += f"- REPRESENTS: {stats['represents']}\n\n"
@@ -2292,7 +2112,7 @@ def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
 
 
 # =============================================================================
-# Streamlit UI
+# Streamlit UI - WITH CONVERSATION MEMORY
 # =============================================================================
 
 def main():
@@ -2304,9 +2124,20 @@ def main():
     
     st.title("🕸️ GraphWeaver Agent")
     st.caption("Chat with Claude to discover FK relationships, build knowledge graphs, and analyze data lineage")
-    st.caption("**Using NEW langchain.agents.create_agent API**")
+    st.caption("**With Conversation Memory** 💾")
     
     with st.sidebar:
+        # =============================================
+        # NEW: CONVERSATION HISTORY SECTION
+        # =============================================
+        render_conversation_sidebar()
+        render_conversation_actions()
+        
+        st.divider()
+        
+        # =============================================
+        # CONFIGURATION SECTION
+        # =============================================
         st.header("⚙️ Configuration")
         
         if DEBUG_MODE:
@@ -2320,7 +2151,6 @@ def main():
         )
         if api_key:
             st.session_state.anthropic_api_key = api_key
-            # Reset agent if API key changes
             if "agent" in st.session_state:
                 del st.session_state.agent
         
@@ -2333,12 +2163,22 @@ def main():
         pg_username = st.text_input("Username", value=st.session_state.get("pg_username", os.environ.get("POSTGRES_USER", "saphenia")))
         pg_password = st.text_input("Password", type="password", value=st.session_state.get("pg_password", os.environ.get("POSTGRES_PASSWORD", "secret")))
         
+        st.session_state.pg_host = pg_host
+        st.session_state.pg_port = pg_port
+        st.session_state.pg_database = pg_database
+        st.session_state.pg_username = pg_username
+        st.session_state.pg_password = pg_password
+        
         st.divider()
         
         st.subheader("🔵 Neo4j")
         neo4j_uri = st.text_input("URI", value=st.session_state.get("neo4j_uri", os.environ.get("NEO4J_URI", "bolt://localhost:7687")))
         neo4j_user = st.text_input("Neo4j User", value=st.session_state.get("neo4j_user", os.environ.get("NEO4J_USER", "neo4j")))
         neo4j_password = st.text_input("Neo4j Password", type="password", value=st.session_state.get("neo4j_password", os.environ.get("NEO4J_PASSWORD", "password")))
+        
+        st.session_state.neo4j_uri = neo4j_uri
+        st.session_state.neo4j_user = neo4j_user
+        st.session_state.neo4j_password = neo4j_password
         
         st.divider()
         
@@ -2351,28 +2191,18 @@ def main():
             st.session_state.quick_action = "Generate text embeddings for semantic search"
         if st.button("📈 Analyze Graph", use_container_width=True):
             st.session_state.quick_action = "Analyze graph centrality and find communities"
-        
-        st.divider()
-        
-        if st.button("🗑️ Clear Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.streaming_messages = []
-            st.rerun()
     
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    if "streaming_messages" not in st.session_state:
-        st.session_state.streaming_messages = []
-    
+    # Check API key
     if not st.session_state.get("anthropic_api_key") and not os.environ.get("ANTHROPIC_API_KEY"):
         st.warning("⚠️ Please enter your Anthropic API key in the sidebar to start chatting.")
         st.stop()
     
-    for message in st.session_state.messages:
+    # Display existing messages
+    for message in st.session_state.get("messages", []):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
+    # Handle quick actions or chat input
     if "quick_action" in st.session_state and st.session_state.quick_action:
         prompt = st.session_state.quick_action
         st.session_state.quick_action = None
@@ -2383,32 +2213,31 @@ def main():
         debug.section("NEW USER MESSAGE")
         debug.agent(f"User: {prompt}")
         
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        # Add user message using conversation memory
+        add_message("user", prompt)
+        
         with st.chat_message("user"):
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
             try:
-                st.session_state.streaming_messages.append({"role": "user", "content": prompt})
                 message_placeholder = st.empty()
                 
+                # Use get_current_streaming_messages() for agent context
                 response = stream_agent_response(
-                    st.session_state.streaming_messages.copy(),
+                    get_current_streaming_messages(),
                     message_placeholder
                 )
                 
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                st.session_state.streaming_messages.append({"role": "assistant", "content": response})
+                # Add assistant response using conversation memory
+                add_message("assistant", response)
                 
-                if len(st.session_state.streaming_messages) > 20:
-                    st.session_state.streaming_messages = st.session_state.streaming_messages[-20:]
-                    
             except Exception as e:
                 debug.error(f"Fatal error: {e}", e)
                 import traceback
                 error_msg = f"Error: {type(e).__name__}: {e}\n\n```\n{traceback.format_exc()}\n```"
                 st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": f"Error: {e}"})
+                add_message("assistant", f"Error: {e}")
 
 
 if __name__ == "__main__":
