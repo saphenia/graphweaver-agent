@@ -17,6 +17,8 @@ import sys
 import streamlit as st
 from typing import Optional, Generator, Dict, Any, List
 import time
+import json
+import anthropic  # Added for true streaming
 
 # =============================================================================
 # DEBUG LOGGING SETUP
@@ -2209,11 +2211,214 @@ def get_agent():
 
 
 # =============================================================================
-# Streaming Chat with Router Agent
+# Tool Definitions for Anthropic SDK (for true streaming)
+# =============================================================================
+
+def get_sdk_tools() -> List[Dict]:
+    """Convert ALL_TOOLS to Anthropic SDK format for true streaming."""
+    sdk_tools = []
+    for t in ALL_TOOLS:
+        # Extract info from LangChain tool
+        name = t.name
+        description = t.description or ""
+        
+        # Build input schema from function signature
+        import inspect
+        sig = inspect.signature(t.func)
+        properties = {}
+        required = []
+        
+        for param_name, param in sig.parameters.items():
+            if param_name in ('self', 'cls'):
+                continue
+            
+            # Determine type
+            param_type = "string"
+            if param.annotation != inspect.Parameter.empty:
+                if param.annotation == int:
+                    param_type = "integer"
+                elif param.annotation == float:
+                    param_type = "number"
+                elif param.annotation == bool:
+                    param_type = "boolean"
+            
+            properties[param_name] = {"type": param_type, "description": f"Parameter: {param_name}"}
+            
+            if param.default == inspect.Parameter.empty:
+                required.append(param_name)
+        
+        sdk_tools.append({
+            "name": name,
+            "description": description,
+            "input_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }
+        })
+    
+    return sdk_tools
+
+
+def execute_tool_by_name(tool_name: str, tool_input: Dict) -> str:
+    """Execute a tool by name with given input."""
+    # Find the tool in ALL_TOOLS
+    for t in ALL_TOOLS:
+        if t.name == tool_name:
+            try:
+                return t.func(**tool_input)
+            except Exception as e:
+                import traceback
+                return f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+    return f"ERROR: Unknown tool: {tool_name}"
+
+
+# =============================================================================
+# TRUE Streaming with Anthropic SDK
+# =============================================================================
+
+def stream_with_anthropic_sdk(messages: List[Dict], message_placeholder, status_placeholder) -> str:
+    """
+    TRUE token-by-token streaming using Anthropic SDK directly.
+    This bypasses the Router Agent but gives real-time character output.
+    """
+    api_key = st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return "ERROR: No API key configured"
+    
+    client = anthropic.Anthropic(api_key=api_key)
+    sdk_tools = get_sdk_tools()
+    
+    full_response = ""
+    api_messages = messages.copy()
+    iteration = 0
+    max_iterations = 20
+    
+    while iteration < max_iterations:
+        iteration += 1
+        debug.agent(f"SDK streaming iteration {iteration}")
+        
+        if iteration > 1:
+            status_placeholder.info(f"🔄 Processing... (iteration {iteration})")
+        
+        current_text = ""
+        tool_use_blocks = []
+        current_tool_id = None
+        current_tool_name = None
+        current_tool_input = ""
+        
+        try:
+            with client.messages.stream(
+                model="claude-sonnet-4-20250514",
+                max_tokens=4096,
+                system=ROUTER_SYSTEM_PROMPT,
+                messages=api_messages,
+                tools=sdk_tools,
+            ) as stream:
+                
+                for event in stream:
+                    if event.type == "content_block_start":
+                        if hasattr(event.content_block, 'type'):
+                            if event.content_block.type == "tool_use":
+                                current_tool_id = event.content_block.id
+                                current_tool_name = event.content_block.name
+                                current_tool_input = ""
+                                full_response += f"\n\n🔧 **{current_tool_name}**\n"
+                                message_placeholder.markdown(full_response + "▌")
+                                debug.tool(f"Tool call: {current_tool_name}")
+                    
+                    elif event.type == "content_block_delta":
+                        if hasattr(event.delta, 'text'):
+                            # TRUE token-by-token streaming!
+                            current_text += event.delta.text
+                            full_response += event.delta.text
+                            message_placeholder.markdown(full_response + "▌")
+                        elif hasattr(event.delta, 'partial_json'):
+                            current_tool_input += event.delta.partial_json
+                    
+                    elif event.type == "content_block_stop":
+                        if current_tool_id and current_tool_name:
+                            try:
+                                tool_input = json.loads(current_tool_input) if current_tool_input else {}
+                            except json.JSONDecodeError:
+                                tool_input = {}
+                            
+                            tool_use_blocks.append({
+                                "id": current_tool_id,
+                                "name": current_tool_name,
+                                "input": tool_input
+                            })
+                            current_tool_id = None
+                            current_tool_name = None
+                            current_tool_input = ""
+                
+                final_message = stream.get_final_message()
+            
+            if final_message.stop_reason != "tool_use":
+                debug.agent("SDK streaming complete (end_turn)")
+                break
+            
+            # Add assistant message
+            api_messages.append({
+                "role": "assistant",
+                "content": final_message.content
+            })
+            
+            # Execute tools
+            tool_results = []
+            for tool_block in tool_use_blocks:
+                tool_name = tool_block["name"]
+                tool_input = tool_block["input"]
+                tool_id = tool_block["id"]
+                
+                debug.tool(f"Executing: {tool_name}")
+                status_placeholder.info(f"⏳ Executing: {tool_name}...")
+                
+                result = execute_tool_by_name(tool_name, tool_input)
+                
+                preview = result[:500] + "..." if len(result) > 500 else result
+                full_response += f"\n```\n{preview}\n```\n"
+                message_placeholder.markdown(full_response + "▌")
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result
+                })
+            
+            api_messages.append({
+                "role": "user",
+                "content": tool_results
+            })
+            
+            tool_use_blocks = []
+            status_placeholder.empty()
+            
+        except anthropic.APIError as e:
+            error_msg = f"\n\n❌ **API Error:** {e}"
+            full_response += error_msg
+            message_placeholder.markdown(full_response)
+            debug.error(f"API error: {e}", e)
+            break
+        except Exception as e:
+            import traceback
+            error_msg = f"\n\n❌ **Error:** {type(e).__name__}: {e}"
+            full_response += error_msg
+            message_placeholder.markdown(full_response)
+            debug.error(f"Stream error: {e}", e)
+            break
+    
+    message_placeholder.markdown(full_response)
+    status_placeholder.empty()
+    return full_response
+
+
+# =============================================================================
+# Streaming Chat with Router Agent (Original - step-by-step)
 # =============================================================================
 
 def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
-    """Stream response from Router Agent."""
+    """Stream response from Router Agent (step-by-step, not token-by-token)."""
     
     agent = get_agent()
     if agent is None:
@@ -2318,6 +2523,18 @@ def main():
         
         st.divider()
         
+        # Streaming mode selector
+        st.subheader("🎯 Streaming Mode")
+        streaming_mode = st.radio(
+            "Choose streaming method:",
+            ["Router Agent (step-by-step)", "Anthropic SDK (token-by-token)"],
+            index=1,  # Default to SDK for true streaming
+            help="SDK mode gives real-time character output. Router mode updates after each tool call."
+        )
+        st.session_state.streaming_mode = streaming_mode
+        
+        st.divider()
+        
         st.subheader("🗄️ PostgreSQL")
         pg_host = st.text_input("Host", value=st.session_state.get("pg_host", os.environ.get("POSTGRES_HOST", "localhost")))
         pg_port = st.number_input("Port", value=int(st.session_state.get("pg_port", os.environ.get("POSTGRES_PORT", "5432"))))
@@ -2325,12 +2542,24 @@ def main():
         pg_username = st.text_input("Username", value=st.session_state.get("pg_username", os.environ.get("POSTGRES_USER", "saphenia")))
         pg_password = st.text_input("Password", type="password", value=st.session_state.get("pg_password", os.environ.get("POSTGRES_PASSWORD", "secret")))
         
+        # Store in session state
+        st.session_state.pg_host = pg_host
+        st.session_state.pg_port = pg_port
+        st.session_state.pg_database = pg_database
+        st.session_state.pg_username = pg_username
+        st.session_state.pg_password = pg_password
+        
         st.divider()
         
         st.subheader("🔵 Neo4j")
         neo4j_uri = st.text_input("URI", value=st.session_state.get("neo4j_uri", os.environ.get("NEO4J_URI", "bolt://localhost:7687")))
         neo4j_user = st.text_input("Neo4j User", value=st.session_state.get("neo4j_user", os.environ.get("NEO4J_USER", "neo4j")))
         neo4j_password = st.text_input("Neo4j Password", type="password", value=st.session_state.get("neo4j_password", os.environ.get("NEO4J_PASSWORD", "password")))
+        
+        # Store in session state
+        st.session_state.neo4j_uri = neo4j_uri
+        st.session_state.neo4j_user = neo4j_user
+        st.session_state.neo4j_password = neo4j_password
         
         st.divider()
         
@@ -2392,11 +2621,20 @@ def main():
             try:
                 st.session_state.streaming_messages.append({"role": "user", "content": prompt})
                 message_placeholder = st.empty()
+                status_placeholder = st.empty()
                 
-                response = stream_agent_response(
-                    st.session_state.streaming_messages.copy(),
-                    message_placeholder
-                )
+                # Choose streaming method based on user selection
+                if st.session_state.get("streaming_mode") == "Anthropic SDK (token-by-token)":
+                    response = stream_with_anthropic_sdk(
+                        st.session_state.streaming_messages.copy(),
+                        message_placeholder,
+                        status_placeholder
+                    )
+                else:
+                    response = stream_agent_response(
+                        st.session_state.streaming_messages.copy(),
+                        message_placeholder
+                    )
                 
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 st.session_state.streaming_messages.append({"role": "assistant", "content": response})
