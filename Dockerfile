@@ -1,4 +1,5 @@
 # graphweaver-agent/Dockerfile
+# GraphWeaver Multi-Agent System
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -18,11 +19,19 @@ RUN uv sync && uv pip install streamlit tf-keras langchain
 ENV HF_HOME=/app/.cache/huggingface
 RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
-# LAYER 3: Source code only
+# LAYER 3: Source code
 COPY src/ ./src/
 COPY mcp_servers/ ./mcp_servers/
-COPY agent.py streamlit_app.py business_rules.yaml debug_logger.py ./
+
+# LAYER 4: Agent files (all agents)
+COPY agent.py ./
+COPY router_agent.py ./
+COPY loan_agent.py ./
+COPY streamlit_app.py ./
+COPY business_rules.yaml ./
+COPY debug_logger.py ./
 
 ENV PYTHONUNBUFFERED=1 PATH="/app/.venv/bin:$PATH"
 
-CMD ["python", "agent.py"]
+# Default command runs the router agent
+CMD ["python", "router_agent.py"]

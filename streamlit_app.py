@@ -8,7 +8,7 @@ graphweaver-agent/streamlit_app.py
 
 Streamlit Chat Interface for GraphWeaver Agent with Real-Time Streaming
 
-UPDATED: Now uses langchain.agents.create_agent API instead of direct Anthropic SDK
+UPDATED: Now uses Router Agent to dispatch to GraphWeaver or Loan agents
 
 WITH TERMINAL DEBUG LOGGING - Run with: DEBUG=1 streamlit run streamlit_app.py
 """
@@ -83,6 +83,11 @@ from graphweaver_agent.dynamic_tools.agent_tools import (
     delete_dynamic_tool,
     DYNAMIC_TOOL_MANAGEMENT_TOOLS,
 )
+
+# =============================================================================
+# Router Agent Import
+# =============================================================================
+from router_agent import create_router_agent, ROUTER_TOOLS, ROUTER_SYSTEM_PROMPT
 
 
 # =============================================================================
@@ -2183,45 +2188,32 @@ def handle_tool_errors(request, handler):
 
 
 # =============================================================================
-# Agent Creation using NEW create_agent API
+# Agent Creation using Router Agent
 # =============================================================================
 
 def get_agent():
-    """Get or create the GraphWeaver agent using create_agent API."""
+    """Get or create the Router Agent that dispatches to specialized agents."""
     if "agent" not in st.session_state:
-        debug.agent("Creating GraphWeaver agent with create_agent API...")
+        debug.agent("Creating Router Agent...")
         
         api_key = st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             return None
         
-        # Create the model
-        model = ChatAnthropic(
-            model="claude-opus-4-5-20251101",
-            temperature=0.1,
-            max_tokens=8192,
-            api_key=api_key,
-        )
+        # Create the Router Agent (it will dispatch to GraphWeaver or Loan agents)
+        st.session_state.agent = create_router_agent(verbose=True)
         
-        # Create agent with NEW API
-        st.session_state.agent = create_agent(
-            model=model,
-            tools=ALL_TOOLS,
-            system_prompt=SYSTEM_PROMPT,
-            middleware=[handle_tool_errors],
-        )
-        
-        debug.agent("✓ Agent created successfully")
+        debug.agent("✓ Router Agent created successfully")
     
     return st.session_state.agent
 
 
 # =============================================================================
-# Streaming Chat with create_agent API
+# Streaming Chat with Router Agent
 # =============================================================================
 
 def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
-    """Stream response from agent using create_agent API with streaming."""
+    """Stream response from Router Agent."""
     
     agent = get_agent()
     if agent is None:
@@ -2230,7 +2222,7 @@ def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
     full_response = ""
     tool_calls_seen = set()
     
-    debug.section("AGENT STREAMING")
+    debug.section("ROUTER AGENT STREAMING")
     debug.agent(f"Input messages: {len(messages)}")
     
     try:
@@ -2242,7 +2234,7 @@ def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
             elif msg["role"] == "assistant":
                 lc_messages.append(AIMessage(content=msg["content"]))
         
-        # Stream response using NEW API
+        # Stream response using Router Agent
         for chunk in agent.stream(
             {"messages": lc_messages},
             stream_mode="values",
@@ -2279,7 +2271,7 @@ def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
                             full_response += f"\n\n🔧 **{tool_name}**\n"
                             message_placeholder.markdown(full_response + "▌")
         
-        debug.agent("Agent finished streaming")
+        debug.agent("Router Agent finished streaming")
         message_placeholder.markdown(full_response)
         return full_response
         
@@ -2297,14 +2289,14 @@ def stream_agent_response(messages: List[Dict], message_placeholder) -> str:
 
 def main():
     st.set_page_config(
-        page_title="GraphWeaver Agent",
-        page_icon="🕸️",
+        page_title="GraphWeaver Multi-Agent",
+        page_icon="🔀",
         layout="wide",
     )
     
-    st.title("🕸️ GraphWeaver Agent")
-    st.caption("Chat with Claude to discover FK relationships, build knowledge graphs, and analyze data lineage")
-    st.caption("**Using NEW langchain.agents.create_agent API**")
+    st.title("🔀 GraphWeaver Multi-Agent System")
+    st.caption("Router Agent dispatches to: 🕸️ GraphWeaver (DB/Graph) | 💰 Loan Agent (Applications)")
+    st.caption("**Using Router Agent with automatic request dispatching**")
     
     with st.sidebar:
         st.header("⚙️ Configuration")
@@ -2343,6 +2335,7 @@ def main():
         st.divider()
         
         st.subheader("🚀 Quick Actions")
+        st.caption("**GraphWeaver:**")
         if st.button("🔍 Discover FKs", use_container_width=True):
             st.session_state.quick_action = "Discover all foreign key relationships in the database"
         if st.button("📊 List Tables", use_container_width=True):
@@ -2351,6 +2344,14 @@ def main():
             st.session_state.quick_action = "Generate text embeddings for semantic search"
         if st.button("📈 Analyze Graph", use_container_width=True):
             st.session_state.quick_action = "Analyze graph centrality and find communities"
+        
+        st.caption("**Loan Agent:**")
+        if st.button("👥 List Applicants", use_container_width=True):
+            st.session_state.quick_action = "Show me all loan applicants"
+        if st.button("💳 Check Credit", use_container_width=True):
+            st.session_state.quick_action = "Check credit score for applicant APP-001"
+        if st.button("📝 Apply for Loan", use_container_width=True):
+            st.session_state.quick_action = "I want to apply for a $50,000 personal loan"
         
         st.divider()
         
@@ -2377,7 +2378,7 @@ def main():
         prompt = st.session_state.quick_action
         st.session_state.quick_action = None
     else:
-        prompt = st.chat_input("Ask me about your database...")
+        prompt = st.chat_input("Ask me anything - I'll route to the right agent...")
     
     if prompt:
         debug.section("NEW USER MESSAGE")
