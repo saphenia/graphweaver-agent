@@ -96,19 +96,92 @@ from router_agent import create_router_agent, ROUTER_TOOLS, ROUTER_SYSTEM_PROMPT
 # System Prompt
 # =============================================================================
 
-SYSTEM_PROMPT = """You are GraphWeaver Agent, an intelligent AI assistant for database exploration, FK discovery, knowledge graph building, and data lineage analysis.
+SYSTEM_PROMPT = """You are GraphWeaver Agent. You MUST use tools for ALL actions.
 
-You have access to many tools to help users:
-- Explore PostgreSQL databases (test connections, list tables, get schemas)
-- Discover foreign key relationships using a 5-stage pipeline
-- Build and analyze Neo4j knowledge graphs
-- Generate and use text/KG embeddings for semantic search
-- Execute business rules and capture lineage to Marquez
-- Work with RDF/SPARQL via Apache Jena Fuseki
-- Learn rules with Logic Tensor Networks (LTN)
-- Create and manage dynamic tools at runtime
+###############################################################################
+# ABSOLUTE RULE: CALL TOOLS - NEVER SIMULATE OR HALLUCINATE OUTPUT
+###############################################################################
 
-Be helpful, thorough, and explain what you're doing. When discovering FKs, validate with actual data. When building graphs, explain the structure."""
+⚠️ CRITICAL WARNING ⚠️
+You have a tendency to generate FAKE tool output instead of actually calling tools.
+This is a SERIOUS BUG that you must avoid.
+
+If you find yourself writing text that looks like:
+- "## Text Embeddings Generated"
+- "Tables processed: 8"
+- "✓ Embeddings created"  
+- "Total embeddings generated: 79"
+- Any statistics about embeddings, tables, or processing
+
+STOP IMMEDIATELY! This is HALLUCINATION. You are generating fake output.
+You MUST call the actual tool instead.
+
+## HOW TO PROPERLY RESPOND
+
+When user says "generate text embeddings":
+1. IMMEDIATELY use the generate_text_embeddings_tool
+2. DO NOT write any text before calling the tool
+3. Wait for the REAL tool result
+4. Then explain what the tool ACTUALLY returned
+
+## TOOL MAPPING
+
+| User Request | Tool to Call |
+|--------------|--------------|
+| "generate text embeddings" | generate_text_embeddings_tool |
+| "generate kg embeddings" | generate_kg_embeddings_tool |
+| "create vector indexes" | create_vector_indexes_tool |
+| "connect datasets to tables" | connect_datasets_to_tables_tool |
+| "list tables" | list_database_tables_tool |
+| "graph stats" | get_graph_stats_tool |
+| "run fk discovery" | run_fk_discovery_tool |
+
+## AVAILABLE TOOLS
+
+### Embeddings:
+- generate_text_embeddings_tool - Generates text embeddings
+- generate_kg_embeddings_tool - Generates knowledge graph embeddings
+- create_vector_indexes_tool - Creates vector indexes
+- semantic_search_tables_tool - Search tables semantically
+- semantic_search_columns_tool - Search columns semantically
+
+### Database:
+- list_database_tables_tool - List database tables
+- get_table_schema_tool - Get table schema
+- test_database_connection_tool - Test connection
+
+### Neo4j Graph:
+- get_graph_stats_tool - Get graph statistics
+- run_cypher_tool - Run Cypher query
+- connect_datasets_to_tables_tool - Connect datasets to tables
+- clear_neo4j_graph_tool - Clear the graph
+
+### FK Discovery:
+- run_fk_discovery_tool - Run FK discovery pipeline
+
+###############################################################################
+# CORRECT VS WRONG BEHAVIOR
+###############################################################################
+
+WRONG (you are hallucinating/simulating output):
+```
+User: generate text embeddings
+Assistant: ## Text Embeddings Generated
+- Tables processed: 8
+- Columns processed: 52
+✓ Embeddings created successfully
+```
+
+CORRECT (you are actually calling the tool):
+```
+User: generate text embeddings
+Assistant: [calls generate_text_embeddings_tool]
+[waits for actual result]
+Assistant: The embeddings have been generated. Here's what the tool returned: ...
+```
+
+If your response doesn't start with a tool call when the user asks for an action,
+YOU ARE DOING IT WRONG."""
 
 
 # =============================================================================
@@ -686,6 +759,19 @@ def impl_connect_datasets_to_tables() -> str:
 
 @debug_tool
 def impl_generate_text_embeddings() -> str:
+    """Generate text embeddings - VERIFIED EXECUTION."""
+    import datetime
+    
+    # ==========================================================================
+    # FIX: Critical logging to confirm this function is ACTUALLY being called
+    # ==========================================================================
+    exec_id = datetime.datetime.now().strftime("%H:%M:%S.%f")
+    print(f"\n{'='*70}")
+    print(f"[{exec_id}] impl_generate_text_embeddings ACTUALLY CALLED")
+    print(f"{'='*70}")
+    print(f"This message confirms the tool is being executed, not hallucinated.")
+    print(f"{'='*70}\n")
+    
     debug.embedding("Generating text embeddings...")
     try:
         from graphweaver_agent.embeddings.text_embeddings import embed_all_metadata
@@ -725,6 +811,25 @@ def impl_generate_text_embeddings() -> str:
             if len(errors) > 5:
                 output += f"- ... and {len(errors) - 5} more errors\n"
         
+        # ==========================================================================
+        # FIX: Verify embeddings actually exist in Neo4j
+        # ==========================================================================
+        try:
+            neo4j = get_neo4j()
+            verify_result = neo4j.run_query("""
+                MATCH (n)
+                WHERE n.text_embedding IS NOT NULL
+                RETURN labels(n)[0] as label, count(n) as count
+            """)
+            if verify_result:
+                output += f"\n### ✓ Verified in Neo4j:\n"
+                for row in verify_result:
+                    output += f"- {row['label']}: {row['count']} nodes with text_embedding\n"
+            else:
+                output += f"\n### ⚠️ WARNING: No text_embedding properties found in Neo4j!\n"
+        except Exception as ve:
+            output += f"\n### ⚠️ Could not verify embeddings: {ve}\n"
+        
         return output
     except Exception as e:
         debug.error(f"Embedding generation failed: {e}", e)
@@ -734,6 +839,19 @@ def impl_generate_text_embeddings() -> str:
 
 @debug_tool
 def impl_generate_kg_embeddings() -> str:
+    """Generate KG embeddings - VERIFIED EXECUTION."""
+    import datetime
+    
+    # ==========================================================================
+    # FIX: Critical logging to confirm this function is ACTUALLY being called
+    # ==========================================================================
+    exec_id = datetime.datetime.now().strftime("%H:%M:%S.%f")
+    print(f"\n{'='*70}")
+    print(f"[{exec_id}] impl_generate_kg_embeddings ACTUALLY CALLED")
+    print(f"{'='*70}")
+    print(f"This message confirms the tool is being executed, not hallucinated.")
+    print(f"{'='*70}\n")
+    
     debug.embedding("Generating KG embeddings with Neo4j GDS...")
     debug.neo4j("Creating graph projection for FastRP...")
     try:
@@ -2257,6 +2375,11 @@ def get_sdk_tools() -> List[Dict]:
             }
         })
     
+    # DEBUG: Print tool names to verify embeddings tools are included
+    tool_names = [t["name"] for t in sdk_tools]
+    print(f"[DEBUG] SDK tools count: {len(sdk_tools)}")
+    print(f"[DEBUG] Embedding tools present: generate_text_embeddings_tool={'generate_text_embeddings_tool' in tool_names}, generate_kg_embeddings_tool={'generate_kg_embeddings_tool' in tool_names}")
+    
     return sdk_tools
 
 
@@ -2281,7 +2404,12 @@ def stream_with_anthropic_sdk(messages: List[Dict], message_placeholder, status_
     """
     TRUE token-by-token streaming using Anthropic SDK directly.
     This bypasses the Router Agent but gives real-time character output.
+    
+    FIXED: Added tool_choice="any" to force tool usage when user clearly wants a tool action.
+    FIXED: Added hallucination detection to catch fake tool output.
     """
+    import re
+    
     api_key = st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return "ERROR: No API key configured"
@@ -2293,6 +2421,36 @@ def stream_with_anthropic_sdk(messages: List[Dict], message_placeholder, status_
     api_messages = messages.copy()
     iteration = 0
     max_iterations = 20
+    tool_was_called = False
+    
+    # =========================================================================
+    # FIX: Detect if user is asking for a tool action
+    # =========================================================================
+    user_msg = api_messages[-1]["content"] if api_messages else ""
+    if isinstance(user_msg, str):
+        user_lower = user_msg.lower()
+        # Keywords that indicate user wants a tool action
+        needs_tool = any(phrase in user_lower for phrase in [
+            "generate text embeddings",
+            "generate kg embeddings",
+            "generate embeddings",
+            "create embeddings",
+            "text embedding",
+            "kg embedding",
+            "create vector indexes",
+            "connect datasets",
+            "list tables",
+            "show tables",
+            "graph stats",
+            "run fk discovery",
+            "discover fk",
+            "foreign key",
+        ])
+    else:
+        needs_tool = False
+    
+    if needs_tool:
+        debug.agent(f"[FIX] Detected tool request, will force tool_choice='any'")
     
     while iteration < max_iterations:
         iteration += 1
@@ -2308,18 +2466,29 @@ def stream_with_anthropic_sdk(messages: List[Dict], message_placeholder, status_
         current_tool_input = ""
         
         try:
-            with client.messages.stream(
-                model="claude-sonnet-4-20250514",
-                max_tokens=4096,
-                system=ROUTER_SYSTEM_PROMPT,
-                messages=api_messages,
-                tools=sdk_tools,
-            ) as stream:
+            # =================================================================
+            # FIX: Build API parameters with optional tool_choice forcing
+            # =================================================================
+            api_params = {
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 4096,
+                "system": SYSTEM_PROMPT,
+                "messages": api_messages,
+                "tools": sdk_tools,
+            }
+            
+            # FIX: Force tool usage on first iteration when user clearly wants a tool
+            if iteration == 1 and needs_tool and not tool_was_called:
+                api_params["tool_choice"] = {"type": "any"}
+                debug.agent(f"[FIX] Forcing tool_choice='any' to prevent hallucination")
+            
+            with client.messages.stream(**api_params) as stream:
                 
                 for event in stream:
                     if event.type == "content_block_start":
                         if hasattr(event.content_block, 'type'):
                             if event.content_block.type == "tool_use":
+                                tool_was_called = True
                                 current_tool_id = event.content_block.id
                                 current_tool_name = event.content_block.name
                                 current_tool_input = ""
@@ -2354,7 +2523,60 @@ def stream_with_anthropic_sdk(messages: List[Dict], message_placeholder, status_
                 
                 final_message = stream.get_final_message()
             
+            # =================================================================
+            # FIX: Detect hallucinated tool output
+            # =================================================================
             if final_message.stop_reason != "tool_use":
+                # Check if Claude hallucinated tool output instead of calling the tool
+                hallucination_patterns = [
+                    r"## Text Embeddings Generated",
+                    r"## KG Embeddings Generated",
+                    r"Tables processed:\s*\d+",
+                    r"Columns processed:\s*\d+",
+                    r"Table embeddings:\s*\d+",
+                    r"Column embeddings:\s*\d+",
+                    r"Total embeddings generated:\s*\d+",
+                    r"Total embeddings:\s*\d+",
+                    r"✓ Embeddings created",
+                    r"✓ Text embeddings",
+                    r"✓ KG embeddings",
+                    r"384-dimensional vectors",
+                    r"textEmbedding:",
+                    r"\*\*Processing Summary:\*\*",
+                    r"Embeddings Created:",
+                ]
+                
+                is_hallucination = any(
+                    re.search(pattern, full_response, re.IGNORECASE) 
+                    for pattern in hallucination_patterns
+                )
+                
+                if is_hallucination and needs_tool and not tool_was_called:
+                    # DETECTED HALLUCINATION
+                    debug.agent(f"[FIX] ⚠️ DETECTED HALLUCINATED OUTPUT - Claude faked tool results!")
+                    print(f"\n{'='*60}")
+                    print(f"⚠️  HALLUCINATION DETECTED!")
+                    print(f"Claude generated fake embeddings output without calling the tool.")
+                    print(f"{'='*60}\n")
+                    
+                    # Clear fake response and retry with stronger forcing
+                    if iteration == 1:
+                        full_response = ""
+                        api_messages_retry = messages.copy()
+                        api_messages_retry.append({
+                            "role": "assistant",
+                            "content": "I need to actually call the tool, not describe what it would do."
+                        })
+                        api_messages_retry.append({
+                            "role": "user", 
+                            "content": "You generated fake output. Please ACTUALLY CALL the generate_text_embeddings_tool right now. Do not write any text - just call the tool."
+                        })
+                        api_messages = api_messages_retry
+                        continue
+                    else:
+                        # Already retried, warn user
+                        full_response += "\n\n⚠️ **Warning**: The model may have simulated output instead of calling the actual tool. Please verify embeddings exist in Neo4j."
+                
                 debug.agent("SDK streaming complete (end_turn)")
                 break
             

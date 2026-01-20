@@ -168,7 +168,8 @@ class KGEmbedder:
         
         try:
             # Run FastRP and write back to graph
-            result = self.neo4j.run_query(f"""
+            # FIX: Must use run_write because gds.fastRP.write is a WRITE operation
+            result = self.neo4j.run_write(f"""
                 CALL gds.fastRP.write(
                     '{self.graph_name}',
                     {{
@@ -223,7 +224,8 @@ class KGEmbedder:
         print(f"[KGEmbedder] Generating Node2Vec embeddings (dim={self.embedding_dimension})...")
         
         try:
-            result = self.neo4j.run_query(f"""
+            # FIX: Must use run_write because gds.node2vec.write is a WRITE operation
+            result = self.neo4j.run_write(f"""
                 CALL gds.node2vec.write(
                     '{self.graph_name}',
                     {{

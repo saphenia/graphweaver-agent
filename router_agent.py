@@ -521,7 +521,7 @@ def create_router_agent(verbose: bool = True):
         raise ValueError("ANTHROPIC_API_KEY environment variable required")
     
     model = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
+        model="claude-opus-4-5-20251101",
         temperature=0.1,
         max_tokens=4096,
     )
