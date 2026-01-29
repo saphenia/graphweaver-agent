@@ -1,17 +1,5 @@
 services:
-  postgres:
-    profiles: ["disabled"]
-  neo4j:
-    profiles: ["disabled"]
-  marquez:
-    profiles: ["disabled"]
-  marquez-db:
-    profiles: ["disabled"]
-  marquez-web:
-    profiles: ["disabled"]
-  fuseki:
-    profiles: ["disabled"]
   agent:
-    depends_on: []
+    profiles: ["disabled"]
   streamlit:
-    depends_on: []
+    profiles: ["disabled"]
