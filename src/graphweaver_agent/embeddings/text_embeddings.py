@@ -3,10 +3,13 @@ Text Embeddings - Generate semantic embeddings for database metadata.
 
 Uses sentence-transformers with all-MiniLM-L6-v2 (384 dimensions).
 Embeddings are stored directly on Neo4j nodes for combined graph+vector queries.
+
+FIXED: Better error handling, failure tracking, and automatic embedding on node creation.
 """
 import os
+import traceback
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -20,22 +23,44 @@ class EmbeddingResult:
     dimensions: int
 
 
+@dataclass
+class EmbeddingStats:
+    """Statistics from embedding generation."""
+    tables: int = 0
+    columns: int = 0
+    jobs: int = 0
+    datasets: int = 0
+    errors: List[Dict[str, str]] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tables": self.tables,
+            "columns": self.columns,
+            "jobs": self.jobs,
+            "datasets": self.datasets,
+            "total_embedded": self.tables + self.columns + self.jobs + self.datasets,
+            "error_count": len(self.errors),
+            "errors": self.errors[:10],  # Limit to first 10 errors
+        }
+
+
 class TextEmbedder:
     """Generate text embeddings using sentence-transformers."""
     
+    _shared_instance = None  # Singleton for reuse
+    
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize the text embedder.
-        
-        Args:
-            model_name: HuggingFace model name. Default is all-MiniLM-L6-v2 (384 dims).
-                       Other options:
-                       - all-mpnet-base-v2 (768 dims, better quality)
-                       - paraphrase-MiniLM-L3-v2 (384 dims, faster)
-        """
         self.model_name = model_name
         self._model = None
         self.dimensions = 384 if "MiniLM" in model_name else 768
+        self._initialized = False
+        
+    @classmethod
+    def get_shared_instance(cls) -> "TextEmbedder":
+        """Get or create a shared embedder instance (avoids reloading model)."""
+        if cls._shared_instance is None:
+            cls._shared_instance = cls()
+        return cls._shared_instance
         
     @property
     def model(self):
@@ -45,24 +70,28 @@ class TextEmbedder:
             try:
                 from sentence_transformers import SentenceTransformer
                 self._model = SentenceTransformer(self.model_name)
+                self._initialized = True
                 print(f"[TextEmbedder] Model loaded successfully")
-            except ImportError:
+            except ImportError as e:
                 raise ImportError(
                     "sentence-transformers not installed. "
                     "Install with: pip install sentence-transformers"
-                )
+                ) from e
+            except Exception as e:
+                print(f"[TextEmbedder] ERROR loading model: {e}")
+                raise
         return self._model
     
+    def is_available(self) -> bool:
+        """Check if the embedder can be used."""
+        try:
+            _ = self.model
+            return True
+        except Exception:
+            return False
+    
     def embed_text(self, text: str) -> EmbeddingResult:
-        """
-        Generate embedding for a single text.
-        
-        Args:
-            text: Text to embed
-            
-        Returns:
-            EmbeddingResult with embedding vector
-        """
+        """Embed a single text string."""
         embedding = self.model.encode(text, convert_to_numpy=True)
         return EmbeddingResult(
             text=text,
@@ -72,16 +101,7 @@ class TextEmbedder:
         )
     
     def embed_texts(self, texts: List[str], batch_size: int = 32) -> List[EmbeddingResult]:
-        """
-        Generate embeddings for multiple texts.
-        
-        Args:
-            texts: List of texts to embed
-            batch_size: Batch size for encoding
-            
-        Returns:
-            List of EmbeddingResults
-        """
+        """Embed multiple texts in batches."""
         if not texts:
             return []
         
@@ -112,22 +132,9 @@ class TextEmbedder:
         data_type: Optional[str] = None,
         description: Optional[str] = None,
     ) -> EmbeddingResult:
-        """
-        Generate embedding for a column with rich context.
-        
-        Args:
-            table_name: Name of the table
-            column_name: Name of the column
-            data_type: SQL data type
-            description: Optional description
-            
-        Returns:
-            EmbeddingResult
-        """
-        # Build rich text representation
+        """Create a rich embedding for a column including semantic hints."""
         parts = [f"{table_name}.{column_name}"]
         
-        # Add semantic hints from name patterns
         col_lower = column_name.lower()
         if col_lower.endswith("_id") or col_lower == "id":
             parts.append("identifier reference key")
@@ -167,20 +174,9 @@ class TextEmbedder:
         column_names: List[str],
         description: Optional[str] = None,
     ) -> EmbeddingResult:
-        """
-        Generate embedding for a table with its columns.
-        
-        Args:
-            table_name: Name of the table
-            column_names: List of column names
-            description: Optional description
-            
-        Returns:
-            EmbeddingResult
-        """
+        """Create a rich embedding for a table including semantic hints."""
         parts = [table_name]
         
-        # Add semantic hints from table name
         tbl_lower = table_name.lower()
         if "order" in tbl_lower:
             parts.append("transaction purchase sales")
@@ -195,7 +191,6 @@ class TextEmbedder:
         if "config" in tbl_lower or "setting" in tbl_lower:
             parts.append("configuration settings system")
             
-        # Add column context (limit to avoid too long text)
         col_text = " ".join(column_names[:20])
         parts.append(f"columns: {col_text}")
         
@@ -213,41 +208,19 @@ class TextEmbedder:
         inputs: List[str],
         outputs: List[str],
     ) -> EmbeddingResult:
-        """
-        Generate embedding for a business rule.
-        
-        Args:
-            name: Rule name
-            description: Rule description
-            sql: SQL query
-            inputs: Input table names
-            outputs: Output table names
-            
-        Returns:
-            EmbeddingResult
-        """
+        """Create an embedding for a business rule."""
         parts = [
             name,
             description,
             f"inputs: {' '.join(inputs)}",
             f"outputs: {' '.join(outputs)}",
-            # Add key SQL keywords for context
             sql[:500] if len(sql) > 500 else sql,
         ]
         text = " ".join(parts)
         return self.embed_text(text)
     
     def similarity(self, emb1: List[float], emb2: List[float]) -> float:
-        """
-        Calculate cosine similarity between two embeddings.
-        
-        Args:
-            emb1: First embedding
-            emb2: Second embedding
-            
-        Returns:
-            Cosine similarity score (0-1)
-        """
+        """Compute cosine similarity between two embeddings."""
         a = np.array(emb1)
         b = np.array(emb2)
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
@@ -257,111 +230,303 @@ def embed_all_metadata(
     neo4j_client,
     pg_connector,
     embedder: Optional[TextEmbedder] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """
     Embed all database metadata and store in Neo4j nodes.
     
+    FIXED: Better error handling with detailed failure tracking.
+    
     Args:
-        neo4j_client: Neo4j client
-        pg_connector: PostgreSQL connector
-        embedder: TextEmbedder instance (creates new if None)
+        neo4j_client: Neo4j client instance
+        pg_connector: PostgreSQL connector instance
+        embedder: Optional TextEmbedder (creates one if not provided)
         
     Returns:
-        Statistics dict with counts
+        Dict with statistics including any errors
     """
     if embedder is None:
-        embedder = TextEmbedder()
+        embedder = TextEmbedder.get_shared_instance()
     
-    stats = {"tables": 0, "columns": 0, "jobs": 0, "datasets": 0}
+    stats = EmbeddingStats()
     
-    # Get all tables
-    tables = pg_connector.get_tables_with_info()
+    # Verify embedder is working
+    try:
+        if not embedder.is_available():
+            return {
+                "error": "TextEmbedder not available - sentence-transformers may not be installed",
+                "stats": stats.to_dict()
+            }
+    except Exception as e:
+        return {
+            "error": f"Failed to initialize embedder: {e}",
+            "stats": stats.to_dict()
+        }
+    
+    # Get tables from PostgreSQL
+    try:
+        tables = pg_connector.get_tables_with_info()
+        print(f"[embed_all_metadata] Found {len(tables)} tables in PostgreSQL")
+    except Exception as e:
+        error_msg = f"Failed to get tables from PostgreSQL: {e}"
+        print(f"[embed_all_metadata] ERROR: {error_msg}")
+        return {"error": error_msg, "stats": stats.to_dict()}
+    
+    if not tables:
+        return {
+            "warning": "No tables found in PostgreSQL",
+            "stats": stats.to_dict()
+        }
+    
     print(f"[embed_all_metadata] Processing {len(tables)} tables...")
     
     for table_info in tables:
         table_name = table_info["table_name"]
         
-        # Get table metadata
         try:
+            # Get table metadata including columns
             meta = pg_connector.get_table_metadata(table_name)
             column_names = [c.column_name for c in meta.columns]
             
-            # Embed table
+            # Generate and store table embedding
             table_emb = embedder.embed_table_metadata(table_name, column_names)
             
-            # Store on Table node
             neo4j_client.run_write("""
-                MATCH (t:Table {name: $name})
+                MERGE (t:Table {name: $name})
                 SET t.text_embedding = $embedding,
-                    t.embedding_model = $model
+                    t.embedding_model = $model,
+                    t.embedding_dim = $dim
             """, {
                 "name": table_name,
                 "embedding": table_emb.embedding,
                 "model": table_emb.model,
+                "dim": table_emb.dimensions,
             })
-            stats["tables"] += 1
+            stats.tables += 1
+            print(f"[embed_all_metadata] ✓ Embedded table: {table_name}")
             
-            # Embed each column
+            # Generate and store column embeddings
             for col in meta.columns:
-                col_emb = embedder.embed_column_metadata(
-                    table_name=table_name,
-                    column_name=col.column_name,
-                    data_type=col.data_type.value if col.data_type else None,
-                )
-                
-                # Store on Column node
-                neo4j_client.run_write("""
-                    MATCH (c:Column {name: $col_name})-[:BELONGS_TO]->(t:Table {name: $table_name})
-                    SET c.text_embedding = $embedding,
-                        c.embedding_model = $model
-                """, {
-                    "col_name": col.column_name,
-                    "table_name": table_name,
-                    "embedding": col_emb.embedding,
-                    "model": col_emb.model,
-                })
-                stats["columns"] += 1
+                try:
+                    col_emb = embedder.embed_column_metadata(
+                        table_name=table_name,
+                        column_name=col.column_name,
+                        data_type=col.data_type.value if col.data_type else None,
+                    )
+                    
+                    neo4j_client.run_write("""
+                        MERGE (t:Table {name: $table_name})
+                        MERGE (c:Column {name: $col_name, table: $table_name})
+                        MERGE (c)-[:BELONGS_TO]->(t)
+                        SET c.text_embedding = $embedding,
+                            c.embedding_model = $model,
+                            c.embedding_dim = $dim,
+                            c.data_type = $data_type
+                    """, {
+                        "col_name": col.column_name,
+                        "table_name": table_name,
+                        "embedding": col_emb.embedding,
+                        "model": col_emb.model,
+                        "dim": col_emb.dimensions,
+                        "data_type": col.data_type.value if col.data_type else None,
+                    })
+                    stats.columns += 1
+                    
+                except Exception as col_error:
+                    error_info = {
+                        "table": table_name,
+                        "column": col.column_name,
+                        "error": str(col_error)
+                    }
+                    stats.errors.append(error_info)
+                    print(f"[embed_all_metadata] ✗ Error embedding column {table_name}.{col.column_name}: {col_error}")
                 
         except Exception as e:
-            print(f"[embed_all_metadata] Error processing {table_name}: {e}")
+            error_info = {"table": table_name, "error": str(e)}
+            stats.errors.append(error_info)
+            print(f"[embed_all_metadata] ✗ Error processing table {table_name}: {e}")
+            traceback.print_exc()
             continue
     
-    # Embed Job nodes (from lineage)
-    jobs = neo4j_client.run_query("MATCH (j:Job) RETURN j.name as name, j.description as desc")
-    if jobs:
-        print(f"[embed_all_metadata] Processing {len(jobs)} jobs...")
-        for job in jobs:
-            text = f"{job['name']} {job.get('desc', '')}"
-            job_emb = embedder.embed_text(text)
-            
-            neo4j_client.run_write("""
-                MATCH (j:Job {name: $name})
-                SET j.text_embedding = $embedding,
-                    j.embedding_model = $model
-            """, {
-                "name": job["name"],
-                "embedding": job_emb.embedding,
-                "model": job_emb.model,
-            })
-            stats["jobs"] += 1
+    # Embed existing Job nodes
+    try:
+        jobs = neo4j_client.run_query("MATCH (j:Job) RETURN j.name as name, j.description as desc")
+        if jobs:
+            print(f"[embed_all_metadata] Processing {len(jobs)} jobs...")
+            for job in jobs:
+                try:
+                    text = f"{job['name']} {job.get('desc', '')}"
+                    job_emb = embedder.embed_text(text)
+                    
+                    neo4j_client.run_write("""
+                        MERGE (j:Job {name: $name})
+                        SET j.text_embedding = $embedding,
+                            j.embedding_model = $model
+                    """, {
+                        "name": job["name"],
+                        "embedding": job_emb.embedding,
+                        "model": job_emb.model,
+                    })
+                    stats.jobs += 1
+                except Exception as job_error:
+                    stats.errors.append({"job": job["name"], "error": str(job_error)})
+    except Exception as e:
+        print(f"[embed_all_metadata] Warning: Could not process jobs: {e}")
     
-    # Embed Dataset nodes (from lineage)
-    datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN d.name as name")
-    if datasets:
-        print(f"[embed_all_metadata] Processing {len(datasets)} datasets...")
-        for ds in datasets:
-            ds_emb = embedder.embed_text(ds["name"])
-            
-            neo4j_client.run_write("""
-                MATCH (d:Dataset {name: $name})
-                SET d.text_embedding = $embedding,
-                    d.embedding_model = $model
-            """, {
-                "name": ds["name"],
-                "embedding": ds_emb.embedding,
-                "model": ds_emb.model,
-            })
-            stats["datasets"] += 1
+    # Embed existing Dataset nodes
+    try:
+        datasets = neo4j_client.run_query("MATCH (d:Dataset) RETURN d.name as name")
+        if datasets:
+            print(f"[embed_all_metadata] Processing {len(datasets)} datasets...")
+            for ds in datasets:
+                try:
+                    ds_emb = embedder.embed_text(ds["name"])
+                    
+                    neo4j_client.run_write("""
+                        MERGE (d:Dataset {name: $name})
+                        SET d.text_embedding = $embedding,
+                            d.embedding_model = $model
+                    """, {
+                        "name": ds["name"],
+                        "embedding": ds_emb.embedding,
+                        "model": ds_emb.model,
+                    })
+                    stats.datasets += 1
+                except Exception as ds_error:
+                    stats.errors.append({"dataset": ds["name"], "error": str(ds_error)})
+    except Exception as e:
+        print(f"[embed_all_metadata] Warning: Could not process datasets: {e}")
     
-    print(f"[embed_all_metadata] Complete: {stats}")
+    result = stats.to_dict()
+    
+    if stats.errors:
+        print(f"\n[embed_all_metadata] COMPLETED WITH {len(stats.errors)} ERRORS:")
+        for err in stats.errors[:5]:
+            print(f"  - {err}")
+        if len(stats.errors) > 5:
+            print(f"  ... and {len(stats.errors) - 5} more errors")
+    else:
+        print(f"\n[embed_all_metadata] COMPLETED SUCCESSFULLY")
+    
+    print(f"[embed_all_metadata] Stats: {result}")
+    return result
+
+
+def verify_embeddings(neo4j_client) -> Dict[str, Any]:
+    """
+    Verify that embeddings are properly stored in Neo4j.
+    
+    Returns statistics about embedding coverage.
+    """
+    result = neo4j_client.run_query("""
+        MATCH (n)
+        WHERE n:Table OR n:Column OR n:Job OR n:Dataset
+        WITH labels(n)[0] AS label,
+             n.text_embedding IS NOT NULL AS has_text_emb,
+             n.kg_embedding IS NOT NULL AS has_kg_emb
+        RETURN label,
+               count(*) AS total,
+               sum(CASE WHEN has_text_emb THEN 1 ELSE 0 END) AS with_text_embedding,
+               sum(CASE WHEN has_kg_emb THEN 1 ELSE 0 END) AS with_kg_embedding
+        ORDER BY label
+    """)
+    
+    stats = {}
+    total_nodes = 0
+    total_with_text = 0
+    total_with_kg = 0
+    
+    for row in result:
+        label = row["label"]
+        stats[label] = {
+            "total": row["total"],
+            "with_text_embedding": row["with_text_embedding"],
+            "with_kg_embedding": row["with_kg_embedding"],
+            "text_coverage": f"{100 * row['with_text_embedding'] / row['total']:.1f}%" if row["total"] > 0 else "N/A",
+            "kg_coverage": f"{100 * row['with_kg_embedding'] / row['total']:.1f}%" if row["total"] > 0 else "N/A",
+        }
+        total_nodes += row["total"]
+        total_with_text += row["with_text_embedding"]
+        total_with_kg += row["with_kg_embedding"]
+    
+    stats["_summary"] = {
+        "total_nodes": total_nodes,
+        "total_with_text_embedding": total_with_text,
+        "total_with_kg_embedding": total_with_kg,
+        "overall_text_coverage": f"{100 * total_with_text / total_nodes:.1f}%" if total_nodes > 0 else "N/A",
+        "overall_kg_coverage": f"{100 * total_with_kg / total_nodes:.1f}%" if total_nodes > 0 else "N/A",
+    }
+    
     return stats
+
+
+# =============================================================================
+# Standalone search functions (used by streamlit_app.py)
+# =============================================================================
+
+def search_tables(neo4j_client, embedder: TextEmbedder, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Search tables by semantic similarity to query."""
+    query_emb = embedder.embed_text(query)
+    
+    results = neo4j_client.run_query("""
+        MATCH (t:Table)
+        WHERE t.text_embedding IS NOT NULL
+        WITH t, gds.similarity.cosine(t.text_embedding, $embedding) AS score
+        WHERE score > 0.3
+        RETURN t.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"embedding": query_emb.embedding, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []
+
+
+def search_columns(neo4j_client, embedder: TextEmbedder, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    """Search columns by semantic similarity to query."""
+    query_emb = embedder.embed_text(query)
+    
+    results = neo4j_client.run_query("""
+        MATCH (c:Column)-[:BELONGS_TO]->(t:Table)
+        WHERE c.text_embedding IS NOT NULL
+        WITH t, c, gds.similarity.cosine(c.text_embedding, $embedding) AS score
+        WHERE score > 0.3
+        RETURN t.name AS table, c.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"embedding": query_emb.embedding, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []
+
+
+def find_similar_tables(neo4j_client, table_name: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Find tables similar to a given table."""
+    results = neo4j_client.run_query("""
+        MATCH (source:Table {name: $table_name})
+        WHERE source.text_embedding IS NOT NULL
+        MATCH (other:Table)
+        WHERE other.name <> $table_name AND other.text_embedding IS NOT NULL
+        WITH other, gds.similarity.cosine(source.text_embedding, other.text_embedding) AS score
+        WHERE score > 0.3
+        RETURN other.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"table_name": table_name, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []
+
+
+def find_similar_columns(neo4j_client, table_name: str, column_name: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    """Find columns similar to a given column."""
+    results = neo4j_client.run_query("""
+        MATCH (source:Column {name: $column_name, table: $table_name})
+        WHERE source.text_embedding IS NOT NULL
+        MATCH (other:Column)-[:BELONGS_TO]->(t:Table)
+        WHERE (other.name <> $column_name OR other.table <> $table_name) 
+          AND other.text_embedding IS NOT NULL
+        WITH t, other, gds.similarity.cosine(source.text_embedding, other.text_embedding) AS score
+        WHERE score > 0.3
+        RETURN t.name AS table, other.name AS name, score
+        ORDER BY score DESC
+        LIMIT $top_k
+    """, {"table_name": table_name, "column_name": column_name, "top_k": top_k})
+    
+    return [dict(r) for r in results] if results else []

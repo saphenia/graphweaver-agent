@@ -2,20 +2,14 @@
 LTN Rule Learner - Learn logical rules from Neo4j knowledge graph.
 
 Uses graph structure and embeddings to learn predicate groundings.
+
+FIXED: Lazy loading of TensorFlow/LTN to avoid conflicts with sentence-transformers.
 """
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
 import numpy as np
 
-try:
-    import ltn
-    import tensorflow as tf
-    LTN_AVAILABLE = True
-except ImportError:
-    LTN_AVAILABLE = False
-    tf = None
-    ltn = None
-
+from .knowledge_base import _ensure_ltn_loaded, get_ltn, get_tf, is_ltn_available
 from .predicates import LTNPredicateFactory
 from .knowledge_base import LTNKnowledgeBase, Axiom, AxiomType
 from .trainer import LTNTrainer, TrainingConfig, TrainingResult
@@ -167,7 +161,7 @@ class LTNRuleLearner:
     
     def prepare_ltn_data(self, training_data: Dict[str, Any]) -> Dict[str, np.ndarray]:
         """Convert training data to LTN format."""
-        if not LTN_AVAILABLE:
+        if not is_ltn_available():
             return {}
         
         ltn_data = {}

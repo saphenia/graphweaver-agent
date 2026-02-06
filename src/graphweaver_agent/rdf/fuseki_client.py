@@ -1,10 +1,21 @@
 """
 Apache Jena Fuseki Client - Connect to RDF triple store.
+
+FIXED: Added detailed logging to debug insert failures.
+FIXED: URL-encode graph URI in GSP requests (was causing 0 triples!)
 """
 import os
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
+from urllib.parse import quote, urlencode
 import requests
+
+
+def _fuseki_banner(msg: str):
+    """Print unmissable banner."""
+    print("*" * 60)
+    print(f"  FUSEKI: {msg}")
+    print("*" * 60)
 
 
 @dataclass
@@ -27,33 +38,49 @@ class FusekiClient:
         self.config = config
         self.base_url = f"{config.url}/{config.dataset}"
         self.auth = (config.username, config.password)
+        print(f"[FusekiClient] Initialized: {self.base_url}")
 
     def test_connection(self) -> Dict[str, Any]:
+        _fuseki_banner("TESTING FUSEKI CONNECTION")
         try:
+            print(f"[FusekiClient] URL: {self.config.url}")
+            print(f"[FusekiClient] Dataset: {self.config.dataset}")
+            print(f"[FusekiClient] Auth user: {self.config.username}")
             response = requests.get(f"{self.config.url}/$/ping", timeout=5)
             if response.status_code == 200:
+                print("[FusekiClient] ✓ Connection successful")
                 return {"success": True, "message": "Connected to Fuseki"}
+            print(f"[FusekiClient] Connection failed: status {response.status_code}")
             return {"success": False, "error": f"Status {response.status_code}"}
         except Exception as e:
+            print(f"[FusekiClient] Connection error: {e}")
             return {"success": False, "error": str(e)}
 
     def ensure_dataset_exists(self) -> bool:
         try:
+            print(f"[FusekiClient] Checking dataset: {self.config.dataset}")
             response = requests.get(
                 f"{self.config.url}/$/datasets/{self.config.dataset}",
                 auth=self.auth, timeout=5
             )
             if response.status_code == 200:
+                print(f"[FusekiClient] ✓ Dataset exists")
                 return True
+            
+            print(f"[FusekiClient] Creating dataset: {self.config.dataset}")
             response = requests.post(
                 f"{self.config.url}/$/datasets",
                 auth=self.auth,
                 data={"dbName": self.config.dataset, "dbType": "tdb2"},
                 timeout=10
             )
-            return response.status_code in [200, 201]
+            if response.status_code in [200, 201]:
+                print(f"[FusekiClient] ✓ Dataset created")
+                return True
+            print(f"[FusekiClient] Failed to create dataset: {response.status_code}")
+            return False
         except Exception as e:
-            print(f"[FusekiClient] Error: {e}")
+            print(f"[FusekiClient] Dataset error: {e}")
             return False
 
     def sparql_query(self, query: str) -> List[Dict[str, Any]]:
@@ -65,6 +92,7 @@ class FusekiClient:
                 timeout=30
             )
             if response.status_code != 200:
+                print(f"[FusekiClient] Query failed: {response.status_code}")
                 return []
             result = response.json()
             bindings = result.get("results", {}).get("bindings", [])
@@ -87,16 +115,32 @@ class FusekiClient:
                 auth=self.auth,
                 timeout=30
             )
-            return response.status_code in [200, 204]
+            success = response.status_code in [200, 204]
+            if not success:
+                print(f"[FusekiClient] Update failed: {response.status_code} - {response.text[:200]}")
+            return success
         except Exception as e:
             print(f"[FusekiClient] Update exception: {e}")
             return False
 
     def insert_turtle(self, turtle_content: str, graph: Optional[str] = None) -> bool:
+        """Insert Turtle RDF data into the store."""
+        _fuseki_banner("INSERT_TURTLE CALLED")
         try:
             url = f"{self.base_url}/data"
             if graph:
-                url += f"?graph={graph}"
+                # URL-encode the graph URI - THIS WAS THE BUG!
+                encoded_graph = quote(graph, safe='')
+                url += f"?graph={encoded_graph}"
+                print(f"[FusekiClient] Graph URI encoded: {graph} -> {encoded_graph}")
+            
+            print(f"[FusekiClient] INSERT to: {url}")
+            print(f"[FusekiClient] Content length: {len(turtle_content)} bytes")
+            
+            # Log first few lines for debugging
+            lines = turtle_content.split('\n')[:5]
+            print(f"[FusekiClient] First lines: {lines}")
+            
             response = requests.post(
                 url,
                 data=turtle_content.encode('utf-8'),
@@ -104,9 +148,20 @@ class FusekiClient:
                 auth=self.auth,
                 timeout=30
             )
-            return response.status_code in [200, 201, 204]
+            
+            success = response.status_code in [200, 201, 204]
+            if success:
+                print(f"[FusekiClient] ✓ Insert successful: {response.status_code}")
+            else:
+                print(f"[FusekiClient] ✗ Insert FAILED: {response.status_code}")
+                print(f"[FusekiClient] Response: {response.text[:500]}")
+            
+            return success
+        except requests.exceptions.ConnectionError as e:
+            print(f"[FusekiClient] Connection error - is Fuseki running? {e}")
+            return False
         except Exception as e:
-            print(f"[FusekiClient] Insert exception: {e}")
+            print(f"[FusekiClient] Insert exception: {type(e).__name__}: {e}")
             return False
 
     def clear_graph(self, graph: Optional[str] = None) -> bool:
@@ -114,6 +169,7 @@ class FusekiClient:
             update = f"CLEAR GRAPH <{graph}>"
         else:
             update = "CLEAR DEFAULT"
+        print(f"[FusekiClient] Executing: {update}")
         return self.sparql_update(update)
 
     def get_triple_count(self, graph: Optional[str] = None) -> int:
@@ -123,5 +179,7 @@ class FusekiClient:
             query = "SELECT (COUNT(*) as ?count) WHERE { ?s ?p ?o }"
         result = self.sparql_query(query)
         if result:
-            return int(result[0].get("count", 0))
+            count = int(result[0].get("count", 0))
+            print(f"[FusekiClient] Triple count ({graph or 'default'}): {count}")
+            return count
         return 0

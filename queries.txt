@@ -1,0 +1,19 @@
+// to show all tripples:
+
+SELECT * 
+WHERE { 
+  GRAPH <http://graphweaver.io/graph/main> { 
+    ?s ?p ?o 
+  } 
+}
+
+
+// to see it grouped by type:
+
+SELECT ?type (COUNT(*) as ?count) 
+WHERE { 
+  GRAPH <http://graphweaver.io/graph/main> { 
+    ?s a ?type 
+  } 
+} 
+GROUP BY ?type

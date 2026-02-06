@@ -470,22 +470,64 @@ class SemanticFilter:
         target_table: str,
         target_column: str,
     ) -> Tuple[bool, str]:
+        """
+        FIXED: More strict semantic filtering to prevent false positives.
+        - Rejects same-table self-references
+        - Requires entity name to match target table
+        - Proper plural handling (category → categories)
+        """
+        # REJECT same-table self-references
+        if source_table.lower() == target_table.lower():
+            return False, f"Self-reference to same table '{source_table}'"
+        
         # Check for value columns
         if self.config.filter_value_columns:
             if is_value_column(source_column):
                 return False, f"Source '{source_column}' is a value column"
         
-        # Check name patterns
+        # Extract entity from source column (e.g., customer_id → customer)
         entity = extract_entity_from_column(source_column)
-        if entity:
-            target_lower = target_table.lower()
-            # Allow if entity matches target table (singular or plural)
-            if entity in target_lower or entity + 's' == target_lower or entity == target_lower.rstrip('s'):
-                return True, "Name pattern matches"
+        target_lower = target_table.lower()
         
-        # If target column is 'id', it's likely valid
+        if entity:
+            # Proper plural handling
+            def pluralize(word):
+                """Handle common English pluralization rules."""
+                if word.endswith('y'):
+                    return word[:-1] + 'ies'  # category → categories
+                elif word.endswith(('s', 'x', 'z', 'ch', 'sh')):
+                    return word + 'es'
+                else:
+                    return word + 's'
+            
+            def singularize(word):
+                """Handle common English singularization rules."""
+                if word.endswith('ies'):
+                    return word[:-3] + 'y'  # categories → category
+                elif word.endswith('es'):
+                    return word[:-2]
+                elif word.endswith('s'):
+                    return word[:-1]
+                return word
+            
+            # Check if entity matches target table
+            entity_plural = pluralize(entity)
+            target_singular = singularize(target_lower)
+            
+            entity_matches = (
+                entity == target_lower or               # exact: customer == customer
+                entity == target_singular or            # customer == customer (from customers)
+                entity_plural == target_lower           # categories == categories
+            )
+            
+            if entity_matches:
+                return True, f"Entity '{entity}' matches table '{target_table}'"
+            else:
+                return False, f"Entity '{entity}' doesn't match table '{target_table}'"
+        
+        # No entity extracted (column doesn't end in _id)
         if target_column.lower() == 'id':
-            return True, "Target is primary key"
+            return False, "No entity in source column name"
         
         return True, "OK"
     
@@ -552,8 +594,9 @@ class FKDetectionPipeline:
                 
                 # Check against all potential targets
                 for target_table, target_col_name, target_col in target_columns:
-                    # Skip self-references to same column
-                    if source_table == target_table and source_col_name == target_col_name:
+                    # FIXED: Skip ALL self-table references (not just same column)
+                    # A FK should reference a DIFFERENT table
+                    if source_table == target_table:
                         continue
                     
                     candidates.append(FKCandidate(

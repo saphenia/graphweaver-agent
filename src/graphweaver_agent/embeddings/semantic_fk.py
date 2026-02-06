@@ -35,15 +35,6 @@ class SemanticFKDiscovery:
         min_semantic_score: float = 0.7,
         min_combined_score: float = 0.6,
     ):
-        """
-        Initialize semantic FK discovery.
-        
-        Args:
-            neo4j_client: Neo4j client
-            text_embedder: TextEmbedder instance (optional)
-            min_semantic_score: Minimum text embedding similarity
-            min_combined_score: Minimum combined score threshold
-        """
         self.neo4j = neo4j_client
         self.text_embedder = text_embedder
         self.min_semantic_score = min_semantic_score
@@ -54,21 +45,7 @@ class SemanticFKDiscovery:
         source_table: Optional[str] = None,
         top_k: int = 50,
     ) -> List[SemanticFKCandidate]:
-        """
-        Find potential FK relationships using semantic similarity.
-        
-        Looks for columns that:
-        1. Have high text embedding similarity (semantically related names)
-        2. Don't already have FK relationships
-        3. Target columns are likely PKs (high uniqueness)
-        
-        Args:
-            source_table: Limit search to this source table (optional)
-            top_k: Max candidates to return
-            
-        Returns:
-            List of SemanticFKCandidate
-        """
+        """Find potential FK relationships using semantic similarity."""
         where_clause = ""
         params = {"top_k": top_k, "min_score": self.min_semantic_score}
         
@@ -76,15 +53,12 @@ class SemanticFKDiscovery:
             where_clause = "AND t1.name = $source_table"
             params["source_table"] = source_table
         
-        # Find semantically similar column pairs without FK
         result = self.neo4j.run_query(f"""
-            // Find columns with ID-like patterns (potential FKs)
             MATCH (c1:Column)-[:BELONGS_TO]->(t1:Table)
             WHERE (c1.name ENDS WITH '_id' OR c1.name ENDS WITH '_code' OR c1.name ENDS WITH '_key')
               AND c1.text_embedding IS NOT NULL
               {where_clause}
             
-            // Find potential target columns (likely PKs - id columns)
             MATCH (c2:Column)-[:BELONGS_TO]->(t2:Table)
             WHERE (c2.name = 'id' OR c2.name ENDS WITH '_id')
               AND c2.text_embedding IS NOT NULL
@@ -92,12 +66,10 @@ class SemanticFKDiscovery:
               AND NOT (c1)-[:FK_TO]->(c2)
               AND NOT (c2)-[:FK_TO]->(c1)
             
-            // Calculate similarity
             WITH t1, c1, t2, c2,
                  gds.similarity.cosine(c1.text_embedding, c2.text_embedding) AS text_sim
             WHERE text_sim > $min_score
             
-            // Add KG similarity if available
             WITH t1, c1, t2, c2, text_sim,
                  CASE 
                    WHEN c1.kg_embedding IS NOT NULL AND c2.kg_embedding IS NOT NULL
@@ -123,7 +95,6 @@ class SemanticFKDiscovery:
         candidates = []
         if result:
             for r in result:
-                # Calculate name similarity for additional context
                 name_sim = self._name_similarity(
                     r["source_column"], 
                     r["target_table"], 
@@ -148,10 +119,33 @@ class SemanticFKDiscovery:
                     recommendation=recommendation,
                 ))
         
-        # Filter by combined score
         candidates = [c for c in candidates if c.combined_score >= self.min_combined_score]
         
         return candidates
+    
+    def discover(
+        self,
+        source_table: Optional[str] = None,
+        min_score: float = 0.6,
+    ) -> List[Dict[str, Any]]:
+        """
+        Discover FK relationships and return as dicts.
+        Convenience method for use with tools.
+        """
+        self.min_combined_score = min_score
+        candidates = self.find_semantic_fk_candidates(source_table=source_table)
+        
+        return [
+            {
+                "source_table": c.source_table,
+                "source_column": c.source_column,
+                "target_table": c.target_table,
+                "target_column": c.target_column,
+                "score": c.combined_score,
+                "recommendation": c.recommendation,
+            }
+            for c in candidates
+        ]
     
     def _name_similarity(
         self, 
@@ -163,8 +157,6 @@ class SemanticFKDiscovery:
         source_lower = source_column.lower()
         target_table_lower = target_table.lower()
         
-        # Check if source column contains target table name
-        # e.g., customer_id -> customers table
         table_singular = target_table_lower.rstrip('s')
         
         if table_singular in source_lower:
@@ -172,7 +164,6 @@ class SemanticFKDiscovery:
         if target_table_lower in source_lower:
             return 0.85
             
-        # Check common patterns
         source_base = source_lower.replace('_id', '').replace('_code', '').replace('_key', '')
         if source_base == table_singular:
             return 0.95
@@ -205,29 +196,13 @@ class SemanticFKDiscovery:
         concept: str,
         top_k: int = 10,
     ) -> List[Dict[str, Any]]:
-        """
-        Find columns matching a concept using semantic search.
-        
-        Examples:
-        - "customer identifier" -> customer_id, buyer_id, client_code
-        - "monetary amount" -> price, cost, total_amount, payment
-        - "creation timestamp" -> created_at, timestamp, date_created
-        
-        Args:
-            concept: Natural language concept
-            top_k: Number of results
-            
-        Returns:
-            List of matching columns with scores
-        """
+        """Find columns matching a concept using semantic search."""
         if self.text_embedder is None:
             from .text_embeddings import TextEmbedder
             self.text_embedder = TextEmbedder()
         
-        # Embed the concept
         concept_emb = self.text_embedder.embed_text(concept)
         
-        # Search using vector index
         result = self.neo4j.run_query("""
             CALL db.index.vector.queryNodes('column_text_embedding', $top_k, $embedding)
             YIELD node, score
@@ -243,20 +218,7 @@ class SemanticFKDiscovery:
         concept: str,
         top_k: int = 5,
     ) -> List[Dict[str, Any]]:
-        """
-        Find tables matching a concept using semantic search.
-        
-        Examples:
-        - "customer data" -> customers, users, accounts
-        - "financial transactions" -> orders, payments, invoices
-        
-        Args:
-            concept: Natural language concept
-            top_k: Number of results
-            
-        Returns:
-            List of matching tables with scores
-        """
+        """Find tables matching a concept using semantic search."""
         if self.text_embedder is None:
             from .text_embeddings import TextEmbedder
             self.text_embedder = TextEmbedder()
@@ -271,3 +233,38 @@ class SemanticFKDiscovery:
         """, {"embedding": concept_emb.embedding, "top_k": top_k})
         
         return [dict(r) for r in result] if result else []
+
+
+# =============================================================================
+# Standalone function (used by streamlit_app.py)
+# =============================================================================
+
+def predict_fks_from_embeddings(
+    neo4j_client,
+    threshold: float = 0.7,
+    top_k: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Predict FK relationships using embedding similarity.
+    Standalone wrapper for SemanticFKDiscovery.
+    
+    Returns list of dicts with: source_table, source_column, target_table, target_column, score
+    """
+    discovery = SemanticFKDiscovery(
+        neo4j_client,
+        min_semantic_score=threshold,
+        min_combined_score=threshold,
+    )
+    
+    candidates = discovery.find_semantic_fk_candidates(top_k=top_k)
+    
+    return [
+        {
+            "source_table": c.source_table,
+            "source_column": c.source_column,
+            "target_table": c.target_table,
+            "target_column": c.target_column,
+            "score": c.combined_score,
+        }
+        for c in candidates
+    ]

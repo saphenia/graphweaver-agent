@@ -3,55 +3,44 @@ name = "graphweaver-agent"
 version = "1.0.0"
 description = "Claude-powered autonomous FK discovery agent with MCP + LangChain"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 
 dependencies = [
     # Database
     "psycopg2-binary>=2.9.0",
     "neo4j>=5.0.0",
-    
     # LangChain + Claude
     "langchain-anthropic>=0.3.10",
+    "langchain>=1.2.0",              # <-- ADD THIS LINE
     "langchain-core>=0.3.30",
     "langgraph>=0.2.60",
-    
     # MCP
     "mcp>=1.0.0",
-    
     # Data validation
     "pydantic>=2.10.0",
-    
     # HTTP requests (for Marquez)
     "requests>=2.31.0",
-    
     # YAML parsing
     "pyyaml>=6.0.0",
-    
     # Text Embeddings
     "sentence-transformers>=2.2.0",
     "torch>=2.0.0",
-    
     # Numerical operations
     "numpy>=1.24.0",
-    
     # SQL formatting (for dynamic tools)
     "sqlparse>=0.5.0",
+    "streamlit>=1.52.2",
+    # LTN - Logic Tensor Networks
+    "ltn>=2.0.0",
+    "tensorflow>=2.15.0,<2.19.0",
+    "tf-keras>=2.15.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.8.0",
-]
-
-ltn = [
-    "ltn>=2.0.0",
-    "tensorflow>=2.20.0",
-]
-
-all = [
-    "graphweaver-agent[dev,ltn]",
 ]
 
 [project.scripts]

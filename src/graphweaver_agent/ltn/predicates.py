@@ -2,20 +2,15 @@
 LTN Predicates for GraphWeaver - Define learnable predicates for database schema.
 
 Predicates represent properties and relationships that can be learned from data.
+
+FIXED: Lazy loading of TensorFlow/LTN to avoid conflicts with sentence-transformers.
 """
 import numpy as np
 from typing import Dict, List, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-try:
-    import ltn
-    import tensorflow as tf
-    LTN_AVAILABLE = True
-except ImportError:
-    LTN_AVAILABLE = False
-    tf = None
-    ltn = None
+from .knowledge_base import _ensure_ltn_loaded, get_ltn, get_tf, is_ltn_available
 
 
 class PredicateType(Enum):
@@ -49,8 +44,11 @@ class BasePredicate:
         
     def build(self) -> Any:
         """Build the LTN predicate."""
-        if not LTN_AVAILABLE:
-            raise ImportError("LTN not installed. Run: pip install ltn")
+        if not _ensure_ltn_loaded():
+            raise ImportError("LTN not installed. Run: pip install ltn tensorflow")
+        
+        tf = get_tf()
+        ltn = get_ltn()
         
         # Create neural network for predicate
         layers = []
