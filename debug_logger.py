@@ -13,12 +13,79 @@ Usage:
 import os
 import sys
 import json
+import re
 import time
 import traceback
 import functools
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from contextlib import contextmanager
+
+
+# Patterns to redact sensitive data before logging
+_SENSITIVE_KEYS = re.compile(
+    r'(?i)(password|passwd|secret|api_key|apikey|token|access_token|refresh_token|'
+    r'credential|authorization|auth|private_key|session_id|cookie)'
+)
+
+_SENSITIVE_PATTERNS = re.compile(
+    r'(?i)(password|passwd|secret|api_key|apikey|token|access_token|refresh_token|'
+    r'credential|authorization|auth|private_key|session_id|cookie)'
+    r'[\s]*[=:]\s*["\']?([^\s"\',}\]]+)["\']?'
+)
+
+
+def _redact_string(text: str) -> str:
+    """Redact sensitive values found in a string."""
+    if not isinstance(text, str):
+        return text
+    return _SENSITIVE_PATTERNS.sub(
+        lambda m: f'{m.group(1)}=***REDACTED***', text
+    )
+
+
+def _redact_dict(data: dict) -> dict:
+    """Recursively redact sensitive keys in a dictionary."""
+    redacted = {}
+    for key, value in data.items():
+        if _SENSITIVE_KEYS.search(str(key)):
+            redacted[key] = "***REDACTED***"
+        elif isinstance(value, dict):
+            redacted[key] = _redact_dict(value)
+        elif isinstance(value, list):
+            redacted[key] = _redact_list(value)
+        elif isinstance(value, str):
+            redacted[key] = _redact_string(value)
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _redact_list(data: list) -> list:
+    """Recursively redact sensitive data in a list."""
+    redacted = []
+    for item in data:
+        if isinstance(item, dict):
+            redacted.append(_redact_dict(item))
+        elif isinstance(item, list):
+            redacted.append(_redact_list(item))
+        elif isinstance(item, str):
+            redacted.append(_redact_string(item))
+        else:
+            redacted.append(item)
+    return redacted
+
+
+def _redact(data: Any) -> Any:
+    """Redact sensitive information from any data type."""
+    if isinstance(data, dict):
+        return _redact_dict(data)
+    elif isinstance(data, (list, tuple)):
+        return _redact_list(list(data))
+    elif isinstance(data, str):
+        return _redact_string(data)
+    else:
+        return data
 
 
 class Colors:
@@ -86,10 +153,10 @@ class DebugLogger:
     
     @classmethod
     def _write(cls, msg: str):
-        print(msg, flush=True)
+        sanitized = _redact_string(str(msg))
+        print(sanitized, flush=True)
         if cls._log_file:
-            import re
-            clean = re.sub(r'\033\[[0-9;]*m', '', msg)
+            clean = re.sub(r'\033\[[0-9;]*m', '', sanitized)
             cls._log_file.write(clean + "\n")
             cls._log_file.flush()
     
@@ -112,6 +179,7 @@ class DebugLogger:
     @classmethod
     def _log_data(cls, data: Any, max_length: int = 2000):
         indent = cls._get_indent() + "    "
+        data = _redact(data)
         
         if isinstance(data, dict):
             try:
@@ -206,9 +274,9 @@ def debug_tool(func: Callable) -> Callable:
         
         with DebugLogger.indent():
             if args:
-                DebugLogger.tool("Args:", list(args))
+                DebugLogger.tool("Args:", _redact(list(args)))
             if kwargs:
-                DebugLogger.tool("Kwargs:", kwargs)
+                DebugLogger.tool("Kwargs:", _redact(kwargs))
             
             start = time.time()
             try:
@@ -248,7 +316,7 @@ class APIStreamLogger:
             if msg.get("role") == "user":
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    DebugLogger.api(f"Last user message: {content[:300]}...")
+                    DebugLogger.api(f"Last user message: {_redact_string(content[:300])}...")
                 elif isinstance(content, list):
                     DebugLogger.api(f"Last user message: (tool results)")
                 break
@@ -282,9 +350,9 @@ class APIStreamLogger:
         if block_type == "tool_use" and self.tool_input_buffer:
             try:
                 parsed = json.loads(self.tool_input_buffer)
-                DebugLogger.tool(f"Tool inputs for {self.current_tool}:", parsed)
+                DebugLogger.tool(f"Tool inputs for {self.current_tool}:", _redact(parsed))
             except:
-                DebugLogger.tool(f"Tool inputs (raw): {self.tool_input_buffer[:500]}")
+                DebugLogger.tool(f"Tool inputs (raw): {_redact_string(self.tool_input_buffer[:500])}")
             self.current_tool = None
             self.tool_input_buffer = ""
         elif block_type == "text":
