@@ -8,3 +8,8 @@ generate kg embeddings
 find similar columns to orders.customer_id
 predict fks from embeddings 
 sync graph to RDF
+SELECT * WHERE {
+  GRAPH <http://graphweaver.io/graph/main> {
+    ?s ?p ?o
+  }
+} LIMIT 50
