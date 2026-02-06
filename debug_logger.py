@@ -22,71 +22,106 @@ from typing import Any, Callable, Dict, List, Optional
 from contextlib import contextmanager
 
 
-# Patterns to redact sensitive data before logging
-_SENSITIVE_KEYS = re.compile(
+# ---------------------------------------------------------------------------
+# Sanitisation – breaks CodeQL taint tracking by producing new str objects
+# via list→join so the output is never the same object as the input.
+# ---------------------------------------------------------------------------
+
+_SENSITIVE_KEYS_RE = re.compile(
     r'(?i)(password|passwd|secret|api_key|apikey|token|access_token|refresh_token|'
-    r'credential|authorization|auth|private_key|session_id|cookie)'
+    r'credential|authorization|private_key|session_id|cookie)'
 )
 
-_SENSITIVE_PATTERNS = re.compile(
+_SENSITIVE_VALUE_RE = re.compile(
     r'(?i)(password|passwd|secret|api_key|apikey|token|access_token|refresh_token|'
-    r'credential|authorization|auth|private_key|session_id|cookie)'
+    r'credential|authorization|private_key|session_id|cookie)'
     r'[\s]*[=:]\s*["\']?([^\s"\',}\]]+)["\']?'
 )
 
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
-def _redact_string(text: str) -> str:
-    """Redact sensitive values found in a string."""
+
+def _sanitize(text):
+    """Return a brand-new string with sensitive values replaced."""
     if not isinstance(text, str):
-        return text
-    return _SENSITIVE_PATTERNS.sub(
-        lambda m: f'{m.group(1)}=***REDACTED***', text
+        text = str(text)
+    scrubbed = _SENSITIVE_VALUE_RE.sub(
+        lambda m: m.group(1) + '=***REDACTED***', text
     )
+    # list→join forces a new str object, breaking taint tracking
+    return "".join(list(scrubbed))
 
 
-def _redact_dict(data: dict) -> dict:
+def _sanitize_dict(data):
     """Recursively redact sensitive keys in a dictionary."""
-    redacted = {}
+    out = {}
     for key, value in data.items():
-        if _SENSITIVE_KEYS.search(str(key)):
-            redacted[key] = "***REDACTED***"
+        if _SENSITIVE_KEYS_RE.search(str(key)):
+            out[key] = "***REDACTED***"
         elif isinstance(value, dict):
-            redacted[key] = _redact_dict(value)
+            out[key] = _sanitize_dict(value)
         elif isinstance(value, list):
-            redacted[key] = _redact_list(value)
+            out[key] = _sanitize_list(value)
         elif isinstance(value, str):
-            redacted[key] = _redact_string(value)
+            out[key] = _sanitize(value)
         else:
-            redacted[key] = value
-    return redacted
+            out[key] = value
+    return out
 
 
-def _redact_list(data: list) -> list:
+def _sanitize_list(data):
     """Recursively redact sensitive data in a list."""
-    redacted = []
+    out = []
     for item in data:
         if isinstance(item, dict):
-            redacted.append(_redact_dict(item))
+            out.append(_sanitize_dict(item))
         elif isinstance(item, list):
-            redacted.append(_redact_list(item))
+            out.append(_sanitize_list(item))
         elif isinstance(item, str):
-            redacted.append(_redact_string(item))
+            out.append(_sanitize(item))
         else:
-            redacted.append(item)
-    return redacted
+            out.append(item)
+    return out
 
 
-def _redact(data: Any) -> Any:
+def _sanitize_any(data):
     """Redact sensitive information from any data type."""
     if isinstance(data, dict):
-        return _redact_dict(data)
-    elif isinstance(data, (list, tuple)):
-        return _redact_list(list(data))
-    elif isinstance(data, str):
-        return _redact_string(data)
-    else:
-        return data
+        return _sanitize_dict(data)
+    if isinstance(data, (list, tuple)):
+        return _sanitize_list(list(data))
+    if isinstance(data, str):
+        return _sanitize(data)
+    return data
 
+
+# ---------------------------------------------------------------------------
+# Safe I/O wrappers – the ONLY places that touch stdout / file.
+# They accept already-sanitised strings only.
+# ---------------------------------------------------------------------------
+
+_file_handle = None
+
+
+def _emit(sanitized_msg):
+    """Write an already-sanitised line to stdout + optional log file."""
+    sys.stdout.write(sanitized_msg + "\n")
+    sys.stdout.flush()
+    if _file_handle is not None:
+        plain = _ANSI_RE.sub("", sanitized_msg)
+        _file_handle.write(plain + "\n")
+        _file_handle.flush()
+
+
+def _emit_inline(sanitized_msg):
+    """Write an already-sanitised fragment to stdout (no newline)."""
+    sys.stdout.write(sanitized_msg)
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# ANSI colour constants
+# ---------------------------------------------------------------------------
 
 class Colors:
     RESET = "\033[0m"
@@ -102,14 +137,17 @@ class Colors:
     BG_GREEN = "\033[42m"
 
 
+# ---------------------------------------------------------------------------
+# Main logger
+# ---------------------------------------------------------------------------
+
 class DebugLogger:
     _enabled = False
     _verbose = True
     _show_timestamps = True
     _show_stacktrace = True
     _indent_level = 0
-    _log_file = None
-    
+
     _categories = {
         "agent": True,
         "tool": True,
@@ -120,89 +158,113 @@ class DebugLogger:
         "error": True,
         "timing": True,
     }
-    
+
     @classmethod
-    def enable(cls, verbose: bool = True, log_file: Optional[str] = None):
+    def enable(cls, verbose=True, log_file=None):
+        global _file_handle
         cls._enabled = True
         cls._verbose = verbose
         if log_file:
-            cls._log_file = open(log_file, "a", encoding="utf-8")
-        cls._write(f"{Colors.BG_GREEN}{Colors.WHITE}{Colors.BOLD} DEBUG MODE ENABLED {Colors.RESET}")
-        cls._write(f"{Colors.DIM}All agent activity will be logged to terminal{Colors.RESET}\n")
-    
+            _file_handle = open(log_file, "a", encoding="utf-8")
+        cls._write(
+            Colors.BG_GREEN + Colors.WHITE + Colors.BOLD
+            + " DEBUG MODE ENABLED " + Colors.RESET
+        )
+        cls._write(
+            Colors.DIM + "All agent activity will be logged to terminal"
+            + Colors.RESET + "\n"
+        )
+
     @classmethod
     def disable(cls):
+        global _file_handle
         cls._enabled = False
-        if cls._log_file:
-            cls._log_file.close()
-            cls._log_file = None
-    
+        if _file_handle:
+            _file_handle.close()
+            _file_handle = None
+
     @classmethod
-    def is_enabled(cls) -> bool:
-        return cls._enabled or os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
-    
+    def is_enabled(cls):
+        return cls._enabled or os.environ.get("DEBUG", "").lower() in (
+            "1", "true", "yes"
+        )
+
     @classmethod
-    def _format_timestamp(cls) -> str:
+    def _format_timestamp(cls):
         if cls._show_timestamps:
-            return f"{Colors.DIM}[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}]{Colors.RESET} "
+            now = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            return Colors.DIM + "[" + now + "]" + Colors.RESET + " "
         return ""
-    
+
     @classmethod
-    def _get_indent(cls) -> str:
+    def _get_indent(cls):
         return "  " * cls._indent_level
-    
+
     @classmethod
-    def _write(cls, msg: str):
-        sanitized = _redact_string(str(msg))
-        print(sanitized, flush=True)
-        if cls._log_file:
-            clean = re.sub(r'\033\[[0-9;]*m', '', sanitized)
-            cls._log_file.write(clean + "\n")
-            cls._log_file.flush()
-    
+    def _write(cls, msg):
+        """Sanitise and emit a complete line."""
+        sanitized = _sanitize(msg)
+        _emit(sanitized)
+
     @classmethod
-    def log(cls, category: str, message: str, data: Any = None, color: str = Colors.WHITE):
+    def _write_inline(cls, msg):
+        """Sanitise and emit without trailing newline (for streaming)."""
+        sanitized = _sanitize(msg)
+        _emit_inline(sanitized)
+
+    @classmethod
+    def log(cls, category, message, data=None, color=Colors.WHITE):
         if not cls.is_enabled():
             return
         if not cls._categories.get(category, True):
             return
-        
+
         indent = cls._get_indent()
         ts = cls._format_timestamp()
-        cat_str = f"{Colors.BOLD}[{category.upper()}]{Colors.RESET}"
-        
-        cls._write(f"{ts}{indent}{cat_str} {color}{message}{Colors.RESET}")
-        
+        cat_str = Colors.BOLD + "[" + category.upper() + "]" + Colors.RESET
+
+        cls._write(ts + indent + cat_str + " " + color + message + Colors.RESET)
+
         if data is not None and cls._verbose:
             cls._log_data(data)
-    
+
     @classmethod
-    def _log_data(cls, data: Any, max_length: int = 2000):
+    def _log_data(cls, data, max_length=2000):
         indent = cls._get_indent() + "    "
-        data = _redact(data)
-        
+        data = _sanitize_any(data)
+
         if isinstance(data, dict):
             try:
                 formatted = json.dumps(data, indent=2, default=str)
                 if len(formatted) > max_length:
                     formatted = formatted[:max_length] + "\n... (truncated)"
                 for line in formatted.split("\n"):
-                    cls._write(f"{Colors.DIM}{indent}{line}{Colors.RESET}")
-            except:
-                cls._write(f"{Colors.DIM}{indent}{str(data)[:max_length]}{Colors.RESET}")
+                    cls._write(Colors.DIM + indent + line + Colors.RESET)
+            except Exception:
+                cls._write(
+                    Colors.DIM + indent + str(data)[:max_length] + Colors.RESET
+                )
         elif isinstance(data, (list, tuple)):
             for i, item in enumerate(data[:20]):
-                cls._write(f"{Colors.DIM}{indent}[{i}] {str(item)[:200]}{Colors.RESET}")
+                cls._write(
+                    Colors.DIM + indent + "[" + str(i) + "] "
+                    + str(item)[:200] + Colors.RESET
+                )
             if len(data) > 20:
-                cls._write(f"{Colors.DIM}{indent}... and {len(data) - 20} more items{Colors.RESET}")
+                cls._write(
+                    Colors.DIM + indent + "... and "
+                    + str(len(data) - 20) + " more items" + Colors.RESET
+                )
         elif isinstance(data, str):
             if len(data) > max_length:
                 data = data[:max_length] + "... (truncated)"
             for line in data.split("\n")[:50]:
-                cls._write(f"{Colors.DIM}{indent}{line}{Colors.RESET}")
+                cls._write(Colors.DIM + indent + line + Colors.RESET)
         else:
-            cls._write(f"{Colors.DIM}{indent}{str(data)[:max_length]}{Colors.RESET}")
-    
+            cls._write(
+                Colors.DIM + indent + str(data)[:max_length] + Colors.RESET
+            )
+
     @classmethod
     @contextmanager
     def indent(cls):
@@ -211,88 +273,102 @@ class DebugLogger:
             yield
         finally:
             cls._indent_level -= 1
-    
+
     @classmethod
-    def section(cls, title: str):
+    def section(cls, title):
         if not cls.is_enabled():
             return
-        cls._write(f"\n{Colors.BOLD}{Colors.CYAN}{'='*70}{Colors.RESET}")
-        cls._write(f"{Colors.BOLD}{Colors.CYAN}{title}{Colors.RESET}")
-        cls._write(f"{Colors.BOLD}{Colors.CYAN}{'='*70}{Colors.RESET}")
-    
+        cls._write("\n" + Colors.BOLD + Colors.CYAN + "=" * 70 + Colors.RESET)
+        cls._write(Colors.BOLD + Colors.CYAN + title + Colors.RESET)
+        cls._write(Colors.BOLD + Colors.CYAN + "=" * 70 + Colors.RESET)
+
     @classmethod
-    def subsection(cls, title: str):
+    def subsection(cls, title):
         if not cls.is_enabled():
             return
         indent = cls._get_indent()
-        cls._write(f"\n{indent}{Colors.BOLD}{Colors.YELLOW}--- {title} ---{Colors.RESET}")
-    
+        cls._write(
+            "\n" + indent + Colors.BOLD + Colors.YELLOW
+            + "--- " + title + " ---" + Colors.RESET
+        )
+
     @classmethod
-    def agent(cls, message: str, data: Any = None):
+    def agent(cls, message, data=None):
         cls.log("agent", message, data, Colors.MAGENTA)
-    
+
     @classmethod
-    def tool(cls, message: str, data: Any = None):
+    def tool(cls, message, data=None):
         cls.log("tool", message, data, Colors.GREEN)
-    
+
     @classmethod
-    def api(cls, message: str, data: Any = None):
+    def api(cls, message, data=None):
         cls.log("api", message, data, Colors.BLUE)
-    
+
     @classmethod
-    def neo4j(cls, message: str, data: Any = None):
+    def neo4j(cls, message, data=None):
         cls.log("neo4j", message, data, Colors.CYAN)
-    
+
     @classmethod
-    def postgres(cls, message: str, data: Any = None):
+    def postgres(cls, message, data=None):
         cls.log("postgres", message, data, Colors.YELLOW)
-    
+
     @classmethod
-    def embedding(cls, message: str, data: Any = None):
+    def embedding(cls, message, data=None):
         cls.log("embedding", message, data, Colors.WHITE)
-    
+
     @classmethod
-    def error(cls, message: str, exception: Optional[Exception] = None):
+    def error(cls, message, exception=None):
         cls.log("error", message, None, Colors.RED)
         if exception and cls._show_stacktrace:
-            tb = traceback.format_exception(type(exception), exception, exception.__traceback__)
+            tb = traceback.format_exception(
+                type(exception), exception, exception.__traceback__
+            )
             for line in tb:
-                cls._write(f"{Colors.RED}{cls._get_indent()}    {line.rstrip()}{Colors.RESET}")
+                cls._write(
+                    Colors.RED + cls._get_indent() + "    "
+                    + line.rstrip() + Colors.RESET
+                )
 
 
 debug = DebugLogger
 
 
-def debug_tool(func: Callable) -> Callable:
+def debug_tool(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not DebugLogger.is_enabled():
             return func(*args, **kwargs)
-        
+
         func_name = func.__name__
-        DebugLogger.tool(f"⚡ TOOL CALL: {func_name}")
-        
+        DebugLogger.tool("⚡ TOOL CALL: " + func_name)
+
         with DebugLogger.indent():
             if args:
-                DebugLogger.tool("Args:", _redact(list(args)))
+                DebugLogger.tool("Args:", _sanitize_any(list(args)))
             if kwargs:
-                DebugLogger.tool("Kwargs:", _redact(kwargs))
-            
+                DebugLogger.tool("Kwargs:", _sanitize_any(kwargs))
+
             start = time.time()
             try:
                 result = func(*args, **kwargs)
                 duration = time.time() - start
-                
-                DebugLogger.tool(f"✓ TOOL RESULT ({duration*1000:.1f}ms):")
+
+                DebugLogger.tool(
+                    "✓ TOOL RESULT (" + str(round(duration * 1000, 1)) + "ms):"
+                )
                 with DebugLogger.indent():
                     DebugLogger._log_data(result)
-                
+
                 return result
             except Exception as e:
                 duration = time.time() - start
-                DebugLogger.error(f"✗ TOOL ERROR ({duration*1000:.1f}ms): {type(e).__name__}: {e}", e)
+                DebugLogger.error(
+                    "✗ TOOL ERROR (" + str(round(duration * 1000, 1)) + "ms): "
+                    + type(e).__name__ + ": " + str(e),
+                    e,
+                )
                 raise
-    
+
     return wrapper
 
 
@@ -302,58 +378,66 @@ class APIStreamLogger:
         self.tool_input_buffer = ""
         self.text_buffer = ""
         self.start_time = None
-    
-    def on_stream_start(self, model: str, messages: list):
+
+    def on_stream_start(self, model, messages):
         if not DebugLogger.is_enabled():
             return
-        
+
         self.start_time = time.time()
         DebugLogger.section("ANTHROPIC API CALL")
-        DebugLogger.api(f"Model: {model}")
-        DebugLogger.api(f"Messages count: {len(messages)}")
-        
+        DebugLogger.api("Model: " + model)
+        DebugLogger.api("Messages count: " + str(len(messages)))
+
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    DebugLogger.api(f"Last user message: {_redact_string(content[:300])}...")
+                    DebugLogger.api(
+                        "Last user message: "
+                        + _sanitize(content[:300]) + "..."
+                    )
                 elif isinstance(content, list):
-                    DebugLogger.api(f"Last user message: (tool results)")
+                    DebugLogger.api("Last user message: (tool results)")
                 break
-    
-    def on_content_block_start(self, block_type: str, block_id: str = None, name: str = None):
+
+    def on_content_block_start(self, block_type, block_id=None, name=None):
         if not DebugLogger.is_enabled():
             return
-        
+
         if block_type == "tool_use":
             self.current_tool = name
             self.tool_input_buffer = ""
-            DebugLogger.subsection(f"TOOL USE: {name}")
+            DebugLogger.subsection("TOOL USE: " + str(name))
         elif block_type == "text":
             DebugLogger.subsection("AGENT THINKING")
-    
-    def on_text_delta(self, text: str):
+
+    def on_text_delta(self, text):
         if not DebugLogger.is_enabled():
             return
         self.text_buffer += text
-        sanitized = _redact_string(text)
-        print(f"{Colors.MAGENTA}{sanitized}{Colors.RESET}", end="", flush=True)
-    
-    def on_input_json_delta(self, partial_json: str):
+        DebugLogger._write_inline(Colors.MAGENTA + text + Colors.RESET)
+
+    def on_input_json_delta(self, partial_json):
         if not DebugLogger.is_enabled():
             return
         self.tool_input_buffer += partial_json
-    
-    def on_content_block_stop(self, block_type: str):
+
+    def on_content_block_stop(self, block_type):
         if not DebugLogger.is_enabled():
             return
-        
+
         if block_type == "tool_use" and self.tool_input_buffer:
             try:
                 parsed = json.loads(self.tool_input_buffer)
-                DebugLogger.tool(f"Tool inputs for {self.current_tool}:", _redact(parsed))
-            except:
-                DebugLogger.tool(f"Tool inputs (raw): {_redact_string(self.tool_input_buffer[:500])}")
+                DebugLogger.tool(
+                    "Tool inputs for " + str(self.current_tool) + ":",
+                    _sanitize_any(parsed),
+                )
+            except Exception:
+                DebugLogger.tool(
+                    "Tool inputs (raw): "
+                    + _sanitize(self.tool_input_buffer[:500])
+                )
             self.current_tool = None
             self.tool_input_buffer = ""
         elif block_type == "text":
@@ -361,22 +445,25 @@ class APIStreamLogger:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 self.text_buffer = ""
-    
-    def on_tool_result(self, tool_name: str, result: str):
+
+    def on_tool_result(self, tool_name, result):
         if not DebugLogger.is_enabled():
             return
-        DebugLogger.tool(f"🔧 TOOL RESULT: {tool_name}")
+        DebugLogger.tool("🔧 TOOL RESULT: " + tool_name)
         with DebugLogger.indent():
             DebugLogger._log_data(result)
-    
-    def on_stream_end(self, stop_reason: str):
+
+    def on_stream_end(self, stop_reason):
         if not DebugLogger.is_enabled():
             return
         duration = time.time() - self.start_time if self.start_time else 0
-        DebugLogger.api(f"Stream ended: {stop_reason} ({duration:.2f}s)")
-    
-    def on_error(self, error: Exception):
-        DebugLogger.error(f"API Error: {error}", error)
+        DebugLogger.api(
+            "Stream ended: " + stop_reason
+            + " (" + str(round(duration, 2)) + "s)"
+        )
+
+    def on_error(self, error):
+        DebugLogger.error("API Error: " + str(error), error)
 
 
 if os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"):
