@@ -127,8 +127,8 @@ class DebugLogger:
         cls._verbose = verbose
         if log_file:
             cls._log_file = open(log_file, "a", encoding="utf-8")
-        print(f"{Colors.BG_GREEN}{Colors.WHITE}{Colors.BOLD} DEBUG MODE ENABLED {Colors.RESET}", flush=True)
-        print(f"{Colors.DIM}All agent activity will be logged to terminal{Colors.RESET}\n", flush=True)
+        cls._write(f"{Colors.BG_GREEN}{Colors.WHITE}{Colors.BOLD} DEBUG MODE ENABLED {Colors.RESET}")
+        cls._write(f"{Colors.DIM}All agent activity will be logged to terminal{Colors.RESET}\n")
     
     @classmethod
     def disable(cls):
@@ -336,7 +336,8 @@ class APIStreamLogger:
         if not DebugLogger.is_enabled():
             return
         self.text_buffer += text
-        print(f"{Colors.MAGENTA}{text}{Colors.RESET}", end="", flush=True)
+        sanitized = _redact_string(text)
+        print(f"{Colors.MAGENTA}{sanitized}{Colors.RESET}", end="", flush=True)
     
     def on_input_json_delta(self, partial_json: str):
         if not DebugLogger.is_enabled():
@@ -357,7 +358,8 @@ class APIStreamLogger:
             self.tool_input_buffer = ""
         elif block_type == "text":
             if self.text_buffer:
-                print(flush=True)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
                 self.text_buffer = ""
     
     def on_tool_result(self, tool_name: str, result: str):
