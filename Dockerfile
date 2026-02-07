@@ -24,7 +24,7 @@ COPY src/ ./src/
 COPY mcp_servers/ ./mcp_servers/
 
 # LAYER 4: Agent files (all agents)
-COPY agent.py ./
+COPY agent.py agent_tools.py agent_streaming.py ./
 COPY router_agent.py ./
 COPY loan_agent.py ./
 COPY streamlit_app.py ./

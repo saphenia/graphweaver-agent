@@ -21,7 +21,7 @@ services:
       retries: 5
 
   neo4j:
-    image: neo4j:5
+    image: neo4j:5.24
     container_name: graphweaver-neo4j
     environment:
       NEO4J_AUTH: neo4j/password
